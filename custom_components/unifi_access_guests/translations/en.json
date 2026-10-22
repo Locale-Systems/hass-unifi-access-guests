@@ -1,0 +1,83 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to UniFi Access",
+        "description": "Create an API token in UniFi Access under Settings → General → API Token, with permission to view doors and to view and edit visitors.",
+        "data": {
+          "host": "Host",
+          "api_token": "API token",
+          "verify_ssl": "Verify SSL certificate"
+        },
+        "data_description": {
+          "host": "IP address or hostname of the console running UniFi Access. The API port (12445) is added unless you give another.",
+          "verify_ssl": "Leave off for the console's default self-signed certificate."
+        }
+      },
+      "calendar": {
+        "title": "Guest calendar",
+        "description": "Every event on this calendar becomes a UniFi Access visitor for the event's times. The event title is the guest's name; put \"PIN: 1234\" in the description to give the guest a PIN.",
+        "data": {
+          "calendar_entity_id": "Calendar",
+          "doors": "Doors guests may open",
+          "horizon_days": "Days ahead to sync",
+          "scan_minutes": "Sync every (minutes)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "New API token",
+        "description": "UniFi Access at {host} rejected the API token. Enter a token with permission to view doors and to view and edit visitors.",
+        "data": {
+          "api_token": "API token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach UniFi Access.",
+      "invalid_auth": "The API token was rejected, or lacks permission to view doors.",
+      "invalid_host": "That host is not valid.",
+      "no_doors": "UniFi Access reported no doors.",
+      "no_doors_selected": "Choose at least one door.",
+      "unknown": "Unexpected error from UniFi Access."
+    },
+    "abort": {
+      "already_configured": "This calendar is already synced to this controller.",
+      "reauth_successful": "The API token was updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Guest sync options",
+        "data": {
+          "doors": "Doors guests may open",
+          "horizon_days": "Days ahead to sync",
+          "scan_minutes": "Sync every (minutes)"
+        }
+      }
+    },
+    "error": {
+      "no_doors_selected": "Choose at least one door."
+    },
+    "abort": {
+      "cannot_connect": "Could not reach UniFi Access.",
+      "invalid_auth": "The API token was rejected.",
+      "unknown": "Unexpected error from UniFi Access."
+    }
+  },
+  "entity": {
+    "button": {
+      "sync_now": {
+        "name": "Sync now"
+      }
+    },
+    "sensor": {
+      "visits": {
+        "name": "Visits"
+      },
+      "last_sync": {
+        "name": "Last sync"
+      }
+    }
+  }
+}

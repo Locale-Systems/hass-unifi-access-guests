@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: linux-x64  # self-hosted Ryzen; runbook: locale-docs ci-self-hosted-linux-runner.md
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The harness pin in requirements-dev.txt (HA 2026.10) requires 3.14.
+          python-version: "3.14"
+
+      - name: Install test harness
+        run: pip install -q -r requirements-dev.txt
+
+      - name: Test gate
+        run: python -m pytest -q

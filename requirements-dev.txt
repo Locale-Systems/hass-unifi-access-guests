@@ -1,0 +1,11 @@
+# Test tooling. The integration itself has no requirements beyond Home
+# Assistant (it uses HA's bundled aiohttp).
+#
+# pytest-homeassistant-custom-component pins an exact homeassistant, so ITS
+# version is the HA the suite tests against: pinned, and bumped deliberately
+# with HA releases (an unpinned harness on a persistent runner stays at
+# whatever it first installed). 0.13.371 = homeassistant 2026.10.0, which
+# requires Python >= 3.14.2; keep setup-python in ci.yaml in step.
+pytest
+pytest-asyncio
+pytest-homeassistant-custom-component==0.13.371
