@@ -171,13 +171,26 @@ def leftovers(access: FakeAccess) -> tuple[str, str]:
     return "group-old", bobs_group
 
 
-async def investigate(client, *, answer: bool | None = True):
+async def investigate(client, *, answer: bool | None = True, delete_ids=()):
     async def confirm(orphans):
         return answer
 
     return await probe.investigate_door_groups(
-        client, "door-gate", now=Clock().now, confirm=None if answer is None else confirm
+        client,
+        "door-gate",
+        now=Clock().now,
+        confirm=None if answer is None else confirm,
+        delete_ids=delete_ids,
     )
+
+
+ALL_STEPS = [
+    "A made-up door group id", "GET /door_groups lists", "A live visitor's group",
+    "GET /door_groups includes", "An update without resources", "End an upcoming visit early",
+    "Reuse the ended visitor", "Cancel a visit", "DELETE /door_groups", "Deleting the visitor, then",
+    "Delete every probe visitor", "Delete the door groups this run made",
+    "Delete leftover visitor door groups (by listing)",
+]
 
 
 async def test_door_groups_all_pass_and_delete_only_orphans(
@@ -186,16 +199,50 @@ async def test_door_groups_all_pass_and_delete_only_orphans(
     access.list_hides_visitor_groups = False  # a controller that lists them
     orphan, bobs_group = leftovers(access)
     steps = await investigate(client)
-    assert [(s.name.split(" ")[0], s.verdict) for s in steps] == [
-        ("GET", "INFO"), ("GET", "PASS"), ("An", "PASS"), ("End", "PASS"),
-        ("Reuse", "PASS"), ("DELETE", "PASS"), ("Deleting", "PASS"),
-        ("Delete", "PASS"), ("Delete", "PASS"),
+    assert [s.name for s in steps] == [
+        next(s.name for s in steps if s.name.startswith(p)) for p in ALL_STEPS
     ]
-    assert "1 of those used by no visitor" in steps[0].detail
+    assert [s.verdict for s in steps] == [
+        "INFO", "INFO", "PASS", "PASS", "PASS", "PASS",
+        "PASS", "PASS", "PASS", "PASS",
+        "PASS", "PASS", "PASS",
+    ]
+    assert "nil pointer" in steps[0].detail  # the fake answers like run 4
+    assert "1 of those used by no visitor" in steps[1].detail
+    assert "start a minute ago" in step_named(steps, "End an upcoming").detail
+    assert "CANCELLED" in step_named(steps, "Cancel a visit").detail
     assert orphan not in access.door_groups
     assert bobs_group in access.door_groups  # a live visitor's group stays
     assert "group-main" in access.door_groups  # not a visitor group
     assert [v["first_name"] for v in access.visitors.values()] == ["Bob"]
+    # Every group the run made is gone: only Bob's and the main group remain.
+    assert set(access.door_groups) == {bobs_group, "group-main"}
+
+
+async def test_a_lookup_crash_reads_as_gone_only_through_the_control(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    # The fake crashes on a missing group, as run 4's controller did; without
+    # the control those deletes would read "unknown", never PASS.
+    steps = await investigate(client, answer=None)
+    assert step_named(steps, "DELETE /door_groups").verdict == "PASS"
+    assert step_named(steps, "Delete the door groups this run made").verdict == "PASS"
+    assert await probe.door_group_state(client, "nope") == (
+        "unknown: GET /api/v1/developer/door_groups/nope: CODE_SYSTEM_ERROR "
+        "runtime error: invalid memory address or nil pointer dereference"
+    )
+
+
+async def test_lookups_that_always_error_prove_nothing(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    # Every lookup errors alike, live group or not: the control would match
+    # everything, so "gone" must not be believed.
+    access.door_group_lookup_error = "CODE_SYSTEM_ERROR"
+    steps = await investigate(client, answer=None)
+    assert step_named(steps, "A live visitor's group").verdict == "FAIL"
+    for prefix in ("DELETE /door_groups", "Deleting the visitor, then", "Delete the door groups this run made"):
+        assert step_named(steps, prefix).verdict != "PASS", prefix
 
 
 @pytest.mark.parametrize("answer", [None, False])
@@ -207,6 +254,43 @@ async def test_door_groups_left_alone_without_a_yes(
     steps = await investigate(client, answer=answer)
     assert steps[-1].verdict == "INFO" and "not deleted" in steps[-1].detail
     assert orphan in access.door_groups
+
+
+async def test_named_leftovers_deleted_only_when_safe(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    orphan, bobs_group = leftovers(access)
+    ids = [orphan, bobs_group, "group-main", "never-existed"]
+    s = step_named(await investigate(client, delete_ids=ids), "Delete the leftover groups named")
+    assert s.verdict == "PASS" and "deleted 1 of 1" in s.detail
+    assert orphan not in access.door_groups
+    assert bobs_group in access.door_groups and "group-main" in access.door_groups
+    assert "a visitor still uses it" in s.detail
+    assert "not a visitor group" in s.detail
+    assert "never-existed: already gone" in s.detail
+
+
+@pytest.mark.parametrize("answer", [None, False])
+async def test_named_leftovers_need_a_yes(client: AccessClient, access: FakeAccess, answer) -> None:
+    orphan, _ = leftovers(access)
+    s = step_named(
+        await investigate(client, answer=answer, delete_ids=[orphan]), "Delete the leftover groups named"
+    )
+    assert s.verdict == "INFO" and "not deleted" in s.detail
+    assert orphan in access.door_groups
+
+
+async def test_controller_that_cleans_up_itself_is_told_apart(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    # Neither replaced nor deleted visitors' groups linger: no DELETE needed,
+    # and the probe must say so rather than report its own delete refused.
+    access.leak_groups_on_update = access.leak_groups_on_delete = False
+    steps = await investigate(client, answer=None)
+    s = step_named(steps, "DELETE /door_groups")
+    assert s.verdict == "INFO" and "already gone before the DELETE" in s.detail
+    s = step_named(steps, "Deleting the visitor, then")
+    assert s.verdict == "PASS" and "removed its group" in s.detail and "by itself" in s.detail
 
 
 async def test_update_without_resources_that_regroups_fails(
@@ -225,6 +309,7 @@ async def test_group_delete_that_keeps_the_group_fails(
     for prefix in ("DELETE /door_groups", "Deleting the visitor, then"):
         s = step_named(steps, prefix)
         assert s.verdict == "FAIL" and "exists" in s.detail
+    assert step_named(steps, "Delete the door groups this run made").verdict == "FAIL"
 
 
 async def test_refused_group_delete_fails(client: AccessClient, access: FakeAccess) -> None:
@@ -233,6 +318,7 @@ async def test_refused_group_delete_fails(client: AccessClient, access: FakeAcce
     steps = await investigate(client)
     assert step_named(steps, "DELETE /door_groups").verdict == "FAIL"
     assert step_named(steps, "Deleting the visitor, then").verdict == "FAIL"
+    assert step_named(steps, "Delete the door groups this run made").verdict == "FAIL"
     assert steps[-1].verdict == "FAIL"  # the offered clean-up could not delete either
 
 
@@ -255,15 +341,29 @@ async def test_hidden_visitor_groups_are_reported_not_passed(
     assert orphan in access.door_groups  # invisible, so untouched
 
 
-async def test_refused_early_end_fails_and_skips_reuse(
+async def test_every_early_end_refused_fails_and_skips_reuse(
     client: AccessClient, access: FakeAccess
 ) -> None:
-    # Refuse any update whose window ends before the probe's clock starts.
-    access.refuse_visitor_update = lambda body: body.get("end_time", 0) < 1_800_000_000
+    clock_start = 1_800_000_000
+    # Refuse any update ending within two minutes of the clock: both tries.
+    access.refuse_visitor_update = lambda body: body.get("end_time", 0) < clock_start + 120
     steps = await investigate(client, answer=None)
     s = step_named(steps, "End an upcoming visit early")
-    assert s.verdict == "FAIL" and "refused" in s.detail
+    assert s.verdict == "FAIL"
+    assert s.detail.count("refused (CODE_PARAMS_INVALID") == 2
     assert step_named(steps, "Reuse the ended visitor").verdict == "SKIP"
+
+
+async def test_early_end_falls_back_to_a_future_start(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    clock_start = 1_800_000_000
+    # Refuse a start in the past, as one reading of run 4 would have it.
+    access.refuse_visitor_update = lambda body: body.get("start_time", clock_start) < clock_start
+    s = step_named(await investigate(client, answer=None), "End an upcoming visit early")
+    assert s.verdict == "PASS"
+    assert "start a minute ago, end in a minute: refused" in s.detail
+    assert "start in 5 s, end in a minute: accepted" in s.detail
 
 
 async def test_early_end_that_regroups_fails(client: AccessClient, access: FakeAccess) -> None:

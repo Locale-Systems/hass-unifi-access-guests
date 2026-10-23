@@ -41,6 +41,7 @@ CALENDAR = "calendar.guests"
 DOORS = [{"id": "door-front", "name": "Front Door"}, {"id": "door-gate", "name": "Gate"}]
 
 _API = re.compile(r"^https://192\.0\.2\.10:12445/api/v1/developer/(?P<path>.*)$")
+NIL_POINTER = "runtime error: invalid memory address or nil pointer dereference"
 _CONSOLE = re.compile(r"^https://192\.0\.2\.10/proxy/(network|protect)/integration/")
 
 
@@ -83,6 +84,9 @@ class FakeAccess:
         self.regroup_without_resources = False
         # GET /door_groups leaves out visitor groups (probe run 3).
         self.list_hides_visitor_groups = True
+        # Looking up a group that doesn't exist crashes the lookup instead
+        # of answering not-found (probe run 4).
+        self.missing_group_lookup_crashes = True
         self.refuse_door_group_delete = False
         # Accept a visitor update but keep the old start and end times.
         self.ignore_update_times = False
@@ -194,7 +198,11 @@ class FakeAccess:
             if self.door_group_lookup_error:
                 return self._response(method, url, code=self.door_group_lookup_error, msg="nope")
             group = self.door_groups.get(parts[1])
-            return self._ok(method, url, group) if group else self._response(method, url, status=404)
+            if group:
+                return self._ok(method, url, group)
+            if self.missing_group_lookup_crashes:
+                return self._response(method, url, code="CODE_SYSTEM_ERROR", msg=NIL_POINTER)
+            return self._response(method, url, status=404)
         if parts[0] == "visitors" and len(parts) == 2:
             visitor_id = parts[1]
             if visitor_id not in self.visitors:
@@ -207,6 +215,10 @@ class FakeAccess:
                 self._store_resources(visitor_id, data)
                 return self._ok(method, url, self.visitors[visitor_id])
             if method == "DELETE":
+                if url.query.get("is_force") == "false":
+                    # Cancel: the record and its group stay.
+                    self.visitors[visitor_id]["status"] = "CANCELLED"
+                    return self._ok(method, url)
                 assert url.query.get("is_force") == "true"
                 visitor = self.visitors.pop(visitor_id)
                 self.pins.pop(visitor_id, None)

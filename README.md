@@ -126,8 +126,15 @@ occurrence. Probe run 3 (`--door-groups`, below) found:
   updates (moving the window, renaming) will stop sending the doors;
 - an update that sends the visitor's own group back leaves it with no
   single group (most likely no door), so that is never done;
-- `DELETE /door_groups/{id}` was refused with HTTP 401, with a token that may
-  not have had every permission. Being re-checked.
+- `DELETE /door_groups/{id}` was refused with HTTP 401 by a token without
+  every permission. With every permission (run 4) the delete went through,
+  and looking the group up afterwards made the controller fail with "nil
+  pointer dereference" instead of answering not-found. The probe now
+  compares that against a lookup of a made-up id to tell whether it means
+  "gone";
+- ending a visit early with both times in the past was refused
+  (`CODE_PARAMS_INVALID`). The probe now tries an end time just ahead, and
+  cancelling (`is_force=false`) as an alternative.
 
 The planned fix: a guest whose events are removed has its visit ended
 early, its PIN removed, and the visitor kept (and reused if the guest is
@@ -169,6 +176,10 @@ With `--door-groups` it runs a different set of checks on one probe visitor:
   visit, both without `resources`, keeping its group;
 - whether `DELETE /door_groups/{id}` removes a group an update replaced, and
   the group of a deleted visitor.
+
+It deletes the groups its own visitors made. `--delete-groups ID ...` deletes
+leftovers from earlier runs by id (the list can't find them), but only
+`visitor-…` groups that no visitor uses, and only after you type `yes`.
 
 It then lists the leftover `visitor-…` groups that no visitor uses, and in a
 terminal deletes them only if you type `yes`. If the list doesn't include
