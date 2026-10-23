@@ -3,7 +3,7 @@
   "name": "UniFi Access Guests",
   "codeowners": ["@gdoerr"],
   "config_flow": true,
-  "dependencies": ["calendar"],
+  "dependencies": ["calendar", "persistent_notification"],
   "documentation": "https://github.com/Locale-Systems/hass-unifi-access-guests",
   "integration_type": "service",
   "iot_class": "local_polling",

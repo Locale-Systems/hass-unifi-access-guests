@@ -33,7 +33,17 @@ MAX_PAGES = 50
 
 
 class AccessError(Exception):
-    """The controller returned an error or an unexpected response."""
+    """The controller returned an error or an unexpected response.
+
+    ``reason`` is the controller's own message when it sent one (for example
+    why it refused a PIN), for showing to people; ``code`` is its error code.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None, reason: str | None = None) -> None:
+        """Initialize the error."""
+        super().__init__(message)
+        self.code = code
+        self.reason = reason or message
 
 
 class AccessAuthError(AccessError):
@@ -194,7 +204,10 @@ class AccessClient:
                     raise AccessAuthError(f"{method} {path}: HTTP {resp.status}")
                 if resp.status != 200:
                     body = (await resp.text())[:200]
-                    raise AccessError(f"{method} {path}: HTTP {resp.status} {body}")
+                    raise AccessError(
+                        f"{method} {path}: HTTP {resp.status} {body}",
+                        reason=f"HTTP {resp.status}",
+                    )
                 try:
                     payload = await resp.json(content_type=None)
                 except ValueError as err:
@@ -206,7 +219,13 @@ class AccessClient:
         except (aiohttp.ClientError, OSError) as err:
             raise AccessConnectionError(f"{method} {path}: {err}") from err
 
-        if not isinstance(payload, dict) or payload.get("code") != "SUCCESS":
-            msg = payload.get("msg") if isinstance(payload, dict) else payload
-            raise AccessError(f"{method} {path}: {msg}")
+        if not isinstance(payload, dict):
+            raise AccessError(f"{method} {path}: unexpected response {payload!r}"[:300])
+        if payload.get("code") != "SUCCESS":
+            msg = payload.get("msg") or "no message"
+            raise AccessError(
+                f"{method} {path}: {payload.get('code')} {msg}",
+                code=payload.get("code"),
+                reason=str(msg),
+            )
         return payload.get("data")

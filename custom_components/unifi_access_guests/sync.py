@@ -1,29 +1,41 @@
 """Turn calendar events into Access visitors, and plan the changes.
 
 Everything here is pure: no I/O, no Home Assistant state. The coordinator
-fetches events and visitors, asks ``plan`` what to do, and carries it out.
+fetches events and visitors, asks ``build_specs`` and ``plan`` what to do, and
+carries it out.
+
+One visitor stands for a *guest*, not an event. Events group by:
+
+- PIN: every event with the same PIN is one guest, since the controller lets
+  a PIN belong to only one visitor. This covers a recurring series and
+  separate events alike.
+- otherwise the recurring series (calendar + uid);
+- otherwise (no uid) the single event.
+
+Each guest's visitor holds a rolling window: the occurrence that is open now,
+or the next one, merged with any occurrences that overlap or touch it. When it
+ends, the next pass moves the same visitor on to the following occurrence.
+The controller never holds more than one window, so it never grants time the
+calendar doesn't show.
 
 Each managed visitor carries a marker in its ``remarks`` field::
 
-    ha-guests:v1:<entry id>:<event key>:<spec digest>:<pin digest>
+    ha-guests:v1:<entry id>:<guest key>:<spec digest>
 
-The marker is the only link between a visitor and the event it came from, and
-it lives on the controller, so a reinstalled Home Assistant (or lost storage)
-still finds and tidies its own visitors. Visitors without a marker for this
-config entry are never touched.
-
-- event key: hash of calendar + event uid + recurrence id, so a moved or
-  renamed event updates its visitor instead of replacing it.
-- spec digest: hash of everything sent to the controller except the PIN.
-- pin digest: keyed hash of the PIN, so a changed PIN is noticed without
-  writing the PIN into the remarks.
+The marker is the only link between a visitor and its guest, and it lives on
+the controller, so a reinstalled Home Assistant (or lost storage) still finds
+and tidies its own visitors. Visitors without a marker for this config entry
+are never touched. The guest key for a PIN is a keyed hash, so the remarks
+never reveal the PIN.
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 import hashlib
 import hmac
+import html
 import re
 
 from .api import Visitor
@@ -32,13 +44,22 @@ from .const import FALLBACK_LAST_NAME, VISIT_REASON
 MARKER_PREFIX = "ha-guests:v1"
 _MARKER_RE = re.compile(
     rf"{re.escape(MARKER_PREFIX)}:(?P<entry>[0-9A-Za-z]+)"
-    r":(?P<key>[0-9a-f]{16}):(?P<spec>[0-9a-f]{8}):(?P<pin>[0-9a-f]{8})"
+    r":(?P<key>[0-9a-f]{16}):(?P<spec>[0-9a-f]{8})"
 )
 REMARKS_TEXT = "Managed by Home Assistant from a calendar event; edits here are overwritten."
 
 # "PIN: 4821", "pin=4821", "PIN 4821". Four to twelve digits; the controller
 # enforces its own configured PIN length.
 _PIN_RE = re.compile(r"\bPIN\s*[:=#]?\s*(\d{4,12})\b", re.IGNORECASE)
+# "NAME: Jane Doe" to the end of its line, stopping short of a PIN on the
+# same line. The colon (or =) is required: "name" is too common a word.
+_NAME_RE = re.compile(
+    r"\bNAME[ \t]*[:=][ \t]*(?P<name>[^\n]*?)\s*(?:\bPIN\b.*)?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Google returns HTML descriptions. Line-ending tags become newlines so a
+# NAME stops at the end of its line; every other tag is dropped.
+_BREAK_RE = re.compile(r"<\s*(?:br\s*/?|/\s*(?:p|div|li|h\d))\s*>", re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -60,7 +81,7 @@ class CalendarItem:
 
 @dataclass(frozen=True, slots=True)
 class VisitSpec:
-    """What one visitor should look like on the controller."""
+    """What one guest's visitor should look like on the controller."""
 
     key: str
     first_name: str
@@ -69,6 +90,8 @@ class VisitSpec:
     end: int
     door_ids: tuple[str, ...]
     pin: str | None
+    # Occurrences still to come after this window, within the horizon.
+    later: int = 0
 
     @property
     def name(self) -> str:
@@ -94,16 +117,6 @@ class Marker:
     entry_id: str
     key: str
     spec: str
-    pin: str
-
-
-@dataclass(frozen=True, slots=True)
-class Update:
-    """Bring an existing visitor in line with its event."""
-
-    visitor: Visitor
-    spec: VisitSpec
-    set_pin: bool
 
 
 @dataclass(slots=True)
@@ -111,12 +124,13 @@ class Plan:
     """Changes needed to make the controller match the calendar."""
 
     creates: list[VisitSpec] = field(default_factory=list)
-    updates: list[Update] = field(default_factory=list)
+    updates: list[tuple[Visitor, VisitSpec]] = field(default_factory=list)
     deletes: list[Visitor] = field(default_factory=list)
     unchanged: list[tuple[Visitor, VisitSpec]] = field(default_factory=list)
-    # Visitors this entry owns that the plan leaves alone because their visit
-    # is over. The controller already refuses them; deleting would erase the
-    # visit from Access's history.
+    # Visitors this entry owns that the plan leaves alone because their guest
+    # has nothing left on the calendar and the visit is over. The controller
+    # already refuses them; deleting would erase the visit from Access's
+    # history.
     ended: list[Visitor] = field(default_factory=list)
 
     @property
@@ -125,22 +139,30 @@ class Plan:
         return not (self.creates or self.updates or self.deletes)
 
 
-def event_key(calendar_entity_id: str, item: CalendarItem) -> str:
-    """Stable identity for one event occurrence.
-
-    Without a uid (some calendar sources omit it) the title and start stand in,
-    so moving such an event replaces its visitor rather than updating it.
-    """
-    if item.uid:
-        ident = f"{calendar_entity_id}\x1f{item.uid}\x1f{item.recurrence_id or ''}"
-    else:
-        ident = f"{calendar_entity_id}\x1f\x1f{item.summary}\x1f{item.start}"
-    return hashlib.sha256(ident.encode()).hexdigest()[:16]
+def _plain_text(description: str) -> str:
+    return html.unescape(_TAG_RE.sub(" ", _BREAK_RE.sub("\n", description)))
 
 
-def split_name(summary: str) -> tuple[str, str]:
-    """Split an event title into first and last name."""
-    words = summary.split()
+def parse_pin(description: str | None) -> str | None:
+    """Find 'PIN: 1234' in an event description."""
+    if not description:
+        return None
+    match = _PIN_RE.search(_plain_text(description))
+    return match.group(1) if match else None
+
+
+def parse_name(description: str | None) -> str | None:
+    """Find 'NAME: Jane Doe' in an event description."""
+    if not description:
+        return None
+    match = _NAME_RE.search(_plain_text(description))
+    name = " ".join(match["name"].split()) if match else ""
+    return name or None
+
+
+def split_name(name: str) -> tuple[str, str]:
+    """Split a full name into first and last name."""
+    words = name.split()
     if not words:
         return "", ""
     if len(words) == 1:
@@ -148,43 +170,88 @@ def split_name(summary: str) -> tuple[str, str]:
     return words[0], " ".join(words[1:])
 
 
-def parse_pin(description: str | None) -> str | None:
-    """Find 'PIN: 1234' in an event description, ignoring any HTML markup."""
-    if not description:
-        return None
-    match = _PIN_RE.search(_TAG_RE.sub(" ", description))
-    return match.group(1) if match else None
+def guest_key(
+    calendar_entity_id: str, item: CalendarItem, pin: str | None, secret: str
+) -> str:
+    """Which guest an event belongs to; see the module docstring."""
+    if pin:
+        # Keyed: an unkeyed hash of a 4-digit PIN is trivially reversed.
+        return hmac.new(
+            secret.encode(), f"pin\x1f{pin}".encode(), hashlib.sha256
+        ).hexdigest()[:16]
+    if item.uid:
+        ident = f"series\x1f{calendar_entity_id}\x1f{item.uid}"
+    else:
+        ident = f"event\x1f{calendar_entity_id}\x1f{item.summary}\x1f{item.start}"
+    return hashlib.sha256(ident.encode()).hexdigest()[:16]
 
 
-def build_spec(
-    calendar_entity_id: str, item: CalendarItem, door_ids: list[str]
-) -> VisitSpec | None:
-    """Turn an event into a visit, or None if it cannot be one."""
-    first, last = split_name(item.summary)
-    if not first or item.end <= item.start:
-        return None
-    return VisitSpec(
-        key=event_key(calendar_entity_id, item),
-        first_name=first,
-        last_name=last,
-        start=item.start,
-        end=item.end,
-        door_ids=tuple(sorted(door_ids)),
-        pin=parse_pin(item.description),
-    )
+@dataclass(frozen=True, slots=True)
+class _Occurrence:
+    first_name: str
+    last_name: str
+    start: int
+    end: int
 
 
-def pin_digest(secret: str, pin: str | None) -> str:
-    """Keyed hash of a PIN; the key keeps a 4-digit PIN from being guessable."""
-    return hmac.new(secret.encode(), (pin or "").encode(), hashlib.sha256).hexdigest()[:8]
+def build_specs(
+    *,
+    calendar_entity_id: str,
+    items: list[CalendarItem],
+    door_ids: list[str],
+    secret: str,
+    now: int,
+) -> tuple[list[VisitSpec], int]:
+    """Group events into guests and give each its current window.
+
+    Returns the specs and the number of events skipped as unusable (no name,
+    or an end not after the start).
+    """
+    groups: dict[str, list[_Occurrence]] = defaultdict(list)
+    pins: dict[str, str | None] = {}
+    skipped = 0
+    for item in items:
+        first, last = split_name(parse_name(item.description) or item.summary)
+        if not first or item.end <= item.start:
+            skipped += 1
+            continue
+        if item.end <= now:
+            continue
+        pin = parse_pin(item.description)
+        key = guest_key(calendar_entity_id, item, pin, secret)
+        groups[key].append(_Occurrence(first, last, item.start, item.end))
+        pins[key] = pin
+
+    doors = tuple(sorted(door_ids))
+    specs: list[VisitSpec] = []
+    for key, occurrences in groups.items():
+        occurrences.sort(key=lambda o: (o.start, o.end))
+        head = occurrences[0]
+        end = head.end
+        rest = 0
+        for occurrence in occurrences[1:]:
+            if occurrence.start <= end:
+                end = max(end, occurrence.end)
+            else:
+                rest += 1
+        specs.append(
+            VisitSpec(
+                key=key,
+                first_name=head.first_name,
+                last_name=head.last_name,
+                start=head.start,
+                end=end,
+                door_ids=doors,
+                pin=pins[key],
+                later=rest,
+            )
+        )
+    return specs, skipped
 
 
-def make_remarks(entry_id: str, spec: VisitSpec, secret: str) -> str:
+def make_remarks(entry_id: str, spec: VisitSpec) -> str:
     """Remarks text carrying the marker for ``spec``."""
-    marker = (
-        f"{MARKER_PREFIX}:{entry_id}:{spec.key}:{spec.spec_digest()}"
-        f":{pin_digest(secret, spec.pin)}"
-    )
+    marker = f"{MARKER_PREFIX}:{entry_id}:{spec.key}:{spec.spec_digest()}"
     return f"{REMARKS_TEXT} [{marker}]"
 
 
@@ -193,17 +260,15 @@ def parse_marker(remarks: str) -> Marker | None:
     match = _MARKER_RE.search(remarks or "")
     if not match:
         return None
-    return Marker(
-        entry_id=match["entry"], key=match["key"], spec=match["spec"], pin=match["pin"]
-    )
+    return Marker(entry_id=match["entry"], key=match["key"], spec=match["spec"])
 
 
-def visitor_body(entry_id: str, spec: VisitSpec, secret: str) -> dict[str, object]:
+def visitor_body(entry_id: str, spec: VisitSpec) -> dict[str, object]:
     """Request body for creating or updating a visitor."""
     return {
         "first_name": spec.first_name,
         "last_name": spec.last_name,
-        "remarks": make_remarks(entry_id, spec, secret),
+        "remarks": make_remarks(entry_id, spec),
         "start_time": spec.start,
         "end_time": spec.end,
         "visit_reason": VISIT_REASON,
@@ -224,7 +289,6 @@ def _drifted(visitor: Visitor, spec: VisitSpec) -> bool:
 def plan(
     *,
     entry_id: str,
-    secret: str,
     desired: list[VisitSpec],
     visitors: list[Visitor],
     now: int,
@@ -232,11 +296,13 @@ def plan(
 ) -> Plan:
     """Work out the creates, updates and deletes.
 
-    ``desired`` holds every visit the calendar shows between ``now`` and
-    ``horizon_end``. A visitor this entry owns whose event is gone is deleted
-    only while its window is still open or upcoming within the horizon: an
-    ended visit stays as history, and one starting past the horizon (left over
-    from a longer horizon setting) is outside what ``desired`` can speak for.
+    ``desired`` holds every guest the calendar shows between ``now`` and
+    ``horizon_end``. A guest's existing visitor is reused even after its
+    window has ended: that is how the rolling window moves on. A visitor whose
+    guest is gone is deleted only while its window is still open or upcoming
+    within the horizon: an ended visit stays as history, and one starting past
+    the horizon (left over from a longer horizon setting) is outside what
+    ``desired`` can speak for.
     """
     result = Plan()
     wanted = {spec.key: spec for spec in desired if spec.end > now}
@@ -258,9 +324,8 @@ def plan(
                 result.deletes.append(visitor)
             continue
         seen.add(marker.key)
-        set_pin = marker.pin != pin_digest(secret, spec.pin)
-        if set_pin or marker.spec != spec.spec_digest() or _drifted(visitor, spec):
-            result.updates.append(Update(visitor=visitor, spec=spec, set_pin=set_pin))
+        if marker.spec != spec.spec_digest() or _drifted(visitor, spec):
+            result.updates.append((visitor, spec))
         else:
             result.unchanged.append((visitor, spec))
 

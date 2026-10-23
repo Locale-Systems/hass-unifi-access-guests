@@ -132,16 +132,96 @@ async def test_all_day_event_runs_local_midnight_to_midnight(
     assert visitor["end_time"] == int(datetime(2026, 11, 7, tzinfo=tz).timestamp())
 
 
-async def test_recurring_occurrences_are_separate_visits(
+async def test_recurring_event_is_one_visitor_that_rolls(
+    hass: HomeAssistant, access: FakeAccess, calendar: FakeCalendar, config_entry,
+    frozen: FrozenDateTimeFactory,
+) -> None:
+    first, second = NOW + timedelta(days=1), NOW + timedelta(days=8)
+    calendar.events = [
+        event("Cleaner", start, uid="r1", recurrence_id=f"occ{n}",
+              description="NAME: Rosa Diaz\nPIN: 4821")
+        for n, start in enumerate((first, second))
+    ]
+    await setup(hass, config_entry)
+    [(vid, visitor)] = access.visitors.items()
+    assert (visitor["first_name"], visitor["last_name"]) == ("Rosa", "Diaz")
+    assert visitor["start_time"] == int(first.timestamp())
+    assert access.pins == {vid: "4821"}
+    [visit] = hass.states.get(VISITS).attributes["visits"]
+    assert visit["later_occurrences"] == 1
+
+    # After the first occurrence ends, the same visitor moves to the second
+    # and keeps its PIN: no new visitor, no PIN request.
+    frozen.move_to(first + timedelta(hours=3))
+    access.calls.clear()
+    await resync(hass, config_entry)
+    assert list(access.visitors) == [vid]
+    assert access.visitors[vid]["start_time"] == int(second.timestamp())
+    assert access.pins == {vid: "4821"}
+    assert [c[:2] for c in access.calls] == [("GET", "visitors"), ("PUT", f"visitors/{vid}")]
+
+
+async def test_same_pin_on_separate_events_shares_a_visitor(
     hass: HomeAssistant, access: FakeAccess, calendar: FakeCalendar, config_entry
 ) -> None:
     calendar.events = [
-        event("Cleaner", NOW + timedelta(days=d), uid="r1", recurrence_id=f"2026110{d}")
+        event("Jane Doe", NOW + timedelta(days=d), uid=f"e{d}", description="PIN: 4821")
         for d in (1, 8)
     ]
     await setup(hass, config_entry)
-    assert sorted(v["last_name"] for v in access.visitors.values()) == ["Guest", "Guest"]
-    assert len({parse_marker(v["remarks"]).key for v in access.visitors.values()}) == 2
+    assert len(access.visitors) == 1
+    assert list(access.pins.values()) == ["4821"]
+    assert hass.states.get(VISITS).attributes["errors"] == []
+
+
+def notifications(hass: HomeAssistant) -> dict:
+    from homeassistant.components import persistent_notification
+
+    return persistent_notification._async_get_or_create_notifications(hass)
+
+
+async def test_pin_in_use_elsewhere_notifies_until_fixed(
+    hass: HomeAssistant, access: FakeAccess, calendar: FakeCalendar, config_entry,
+    frozen: FrozenDateTimeFactory,
+) -> None:
+    # A hand-made visitor (not ours) already holds the PIN.
+    other = access.add_visitor(first_name="Plumber", last_name="Bob", remarks="")
+    access.pins[other] = "4821"
+    calendar.events = [event("Jane Doe", NOW + timedelta(days=1), uid="e1",
+                             description="PIN: 4821")]
+    await setup(hass, config_entry)
+
+    assert list(access.visitors) == [other]  # the new visitor was removed
+    [note] = notifications(hass).values()
+    assert "Jane Doe" in note["message"]
+    assert "PIN already in use" in note["message"]
+    assert "4821" not in note["message"]
+    assert any("set the PIN" in e for e in hass.states.get(VISITS).attributes["errors"])
+
+    # Unchanged on the next pass: the notification is not raised again.
+    raised = note["created_at"]
+    frozen.tick(timedelta(minutes=1))  # a re-raise would carry a new time
+    await resync(hass, config_entry)
+    [note] = notifications(hass).values()
+    assert note["created_at"] == raised
+
+    # The event gets another PIN: the visit syncs and the notification clears.
+    calendar.events = [event("Jane Doe", NOW + timedelta(days=1), uid="e1",
+                             description="PIN: 5555")]
+    await resync(hass, config_entry)
+    assert notifications(hass) == {}
+    assert sorted(access.pins.values()) == ["4821", "5555"]
+
+
+async def test_unloading_clears_notifications(
+    hass: HomeAssistant, access: FakeAccess, calendar: FakeCalendar, config_entry
+) -> None:
+    access.fail["POST visitors"] = "code"
+    calendar.events = [event("Jane Doe", NOW + timedelta(days=1), uid="e1")]
+    await setup(hass, config_entry)
+    assert len(notifications(hass)) == 1
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    assert notifications(hass) == {}
 
 
 async def test_unreadable_calendar_changes_nothing(
@@ -162,17 +242,19 @@ async def test_failed_pin_removes_the_new_visitor_and_retries(
 ) -> None:
     calendar.events = [event("Jane Doe", NOW + timedelta(days=1), uid="e1",
                              description="PIN: 4821")]
-    access.fail["PUT pin_codes"] = "code"  # e.g. PIN already in use
+    access.fail["PUT pin_codes"] = "code"  # a one-off failure
     await setup(hass, config_entry)
     assert access.visitors == {}
     state = hass.states.get(VISITS)
     assert state.state == "0"
-    assert any("PIN for Jane Doe" in e for e in state.attributes["errors"])
+    assert any(e.startswith("Jane Doe") and "set the PIN" in e for e in state.attributes["errors"])
+    assert len(notifications(hass)) == 1
 
     await resync(hass, config_entry)
     [vid] = access.visitors
     assert access.pins == {vid: "4821"}
     assert hass.states.get(VISITS).attributes["errors"] == []
+    assert notifications(hass) == {}
 
 
 async def test_one_failure_does_not_stop_the_rest(

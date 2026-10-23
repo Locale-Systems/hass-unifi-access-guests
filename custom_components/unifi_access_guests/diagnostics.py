@@ -41,16 +41,13 @@ async def async_get_config_entry_diagnostics(
             "updated": result.updated if result else None,
             "deleted": result.deleted if result else None,
             "skipped_events": result.skipped_events if result else None,
-            "errors": result.errors if result else None,
+            "errors": [e.describe() for e in result.errors] if result else None,
         },
         "last_plan": None
         if work is None
         else {
             "creates": [s.key for s in work.creates],
-            "updates": [
-                {"visitor": visitor(u.visitor), "key": u.spec.key, "set_pin": u.set_pin}
-                for u in work.updates
-            ],
+            "updates": [{"visitor": visitor(v), "key": s.key} for v, s in work.updates],
             "deletes": [visitor(v) for v in work.deletes],
             "unchanged": [visitor(v) for v, _ in work.unchanged],
             "ended": [visitor(v) for v in work.ended],

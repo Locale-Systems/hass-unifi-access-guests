@@ -117,6 +117,12 @@ class FakeAccess:
         if parts[0] == "visitors" and parts[2:] == ["pin_codes"]:
             visitor_id = parts[1]
             if method == "PUT":
+                # The controller lets a PIN belong to one credential holder.
+                # The real error code is unverified; this one is made up.
+                if any(p == data["pin_code"] for v, p in self.pins.items() if v != visitor_id):
+                    return self._response(
+                        method, url, code="CODE_PIN_IN_USE", msg="PIN already in use"
+                    )
                 self.pins[visitor_id] = data["pin_code"]
             else:
                 self.pins.pop(visitor_id, None)

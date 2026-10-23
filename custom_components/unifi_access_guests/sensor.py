@@ -26,7 +26,11 @@ async def async_setup_entry(
 
 
 class VisitsSensor(GuestsEntity, SensorEntity):
-    """Open and upcoming visits on the controller, with the last pass's errors."""
+    """Guests with an open or upcoming visit on the controller.
+
+    Each guest is one visitor holding its current or next window; repeat
+    visits are counted in ``later_occurrences``, not as separate visits.
+    """
 
     _attr_native_unit_of_measurement = "visits"
 
@@ -46,10 +50,11 @@ class VisitsSensor(GuestsEntity, SensorEntity):
                     "start": visit.start.isoformat(),
                     "end": visit.end.isoformat(),
                     "has_pin": visit.has_pin,
+                    "later_occurrences": visit.later,
                 }
                 for visit in data.visits
             ],
-            "errors": data.errors,
+            "errors": [error.describe() for error in data.errors],
             "skipped_events": data.skipped_events,
         }
 

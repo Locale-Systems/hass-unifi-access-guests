@@ -16,7 +16,7 @@
       },
       "calendar": {
         "title": "Guest calendar",
-        "description": "Every event on this calendar becomes a UniFi Access visitor for the event's times. The event title is the guest's name; put \"PIN: 1234\" in the description to give the guest a PIN.",
+        "description": "Every event on this calendar gives a guest UniFi Access for the event's times. The guest's name is the event title, or a \"NAME: Jane Doe\" line in the description; a \"PIN: 1234\" line gives them a PIN. Events with the same PIN, and the occurrences of a repeating event, share one visitor.",
         "data": {
           "calendar_entity_id": "Calendar",
           "doors": "Doors guests may open",

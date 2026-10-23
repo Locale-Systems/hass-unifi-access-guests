@@ -6,12 +6,12 @@ from custom_components.unifi_access_guests.api import Visitor
 from custom_components.unifi_access_guests.sync import (
     CalendarItem,
     VisitSpec,
-    build_spec,
-    event_key,
+    build_specs,
+    guest_key,
     make_remarks,
     parse_marker,
+    parse_name,
     parse_pin,
-    pin_digest,
     plan,
     split_name,
 )
@@ -21,38 +21,43 @@ SECRET = "s" * 32
 CAL = "calendar.guests"
 NOW = 1_800_000_000
 HOUR = 3600
-HORIZON = NOW + 30 * 24 * HOUR
+DAY = 24 * HOUR
+HORIZON = NOW + 30 * DAY
 
 
-def item(summary="Jane Doe", start=NOW + HOUR, end=NOW + 2 * HOUR, *, uid="uid-1",
+def item(summary="Jane Doe", start=NOW + HOUR, end=None, *, uid="uid-1",
          recurrence_id=None, description=None) -> CalendarItem:
     return CalendarItem(summary=summary, description=description, start=start,
-                        end=end, uid=uid, recurrence_id=recurrence_id)
+                        end=start + HOUR if end is None else end, uid=uid,
+                        recurrence_id=recurrence_id)
+
+
+def specs(*items: CalendarItem, now: int = NOW, doors=("door-b", "door-a")):
+    return build_specs(calendar_entity_id=CAL, items=list(items), door_ids=list(doors),
+                       secret=SECRET, now=now)
 
 
 def spec(**kwargs) -> VisitSpec:
-    built = build_spec(CAL, item(**kwargs), ["door-b", "door-a"])
-    assert built is not None
+    [built], _ = specs(item(**kwargs))
     return built
 
 
 def visitor_for(s: VisitSpec, *, vid="v1", entry=ENTRY, start=None, end=None,
                 first=None, remarks=None) -> Visitor:
-    data = {
+    return Visitor.from_api({
         "id": vid,
         "first_name": first or s.first_name,
         "last_name": s.last_name,
-        "remarks": remarks if remarks is not None else make_remarks(entry, s, SECRET),
+        "remarks": remarks if remarks is not None else make_remarks(entry, s),
         "start_time": s.start if start is None else start,
         "end_time": s.end if end is None else end,
         "status": "UPCOMING",
-    }
-    return Visitor.from_api(data)
+    })
 
 
 def run(desired, visitors, now=NOW, horizon_end=HORIZON):
-    return plan(entry_id=ENTRY, secret=SECRET, desired=desired, visitors=visitors,
-                now=now, horizon_end=horizon_end)
+    return plan(entry_id=ENTRY, desired=desired, visitors=visitors, now=now,
+                horizon_end=horizon_end)
 
 
 # --- parsing --------------------------------------------------------------
@@ -77,55 +82,137 @@ def test_parse_pin() -> None:
     assert parse_pin("no code here") is None
 
 
-def test_build_spec_rejects_unusable_events() -> None:
-    assert build_spec(CAL, item(summary="  "), ["d"]) is None
-    assert build_spec(CAL, item(start=NOW, end=NOW), ["d"]) is None
+def test_parse_name() -> None:
+    assert parse_name("NAME: Jane Doe") == "Jane Doe"
+    assert parse_name("Notes\nname = Sam  Lee \nmore") == "Sam Lee"
+    # Stops before a PIN on the same line.
+    assert parse_name("NAME: Ann Kim PIN: 4821") == "Ann Kim"
+    # HTML: the name ends with its paragraph, and entities decode.
+    assert parse_name("<p>NAME: Zo&euml; Hart</p><p>PIN: 4821</p>") == "Zoë Hart"
+    assert parse_name("<b>Name:</b>&nbsp;Bo Ray<br>PIN: 1234") == "Bo Ray"
+    # Needs the colon, and the whole word.
+    assert parse_name("Name the dog") is None
+    assert parse_name("USERNAME: jdoe") is None
+    # Never reaches onto the next line.
+    assert parse_name("NAME:\nJane Doe") is None
+    assert parse_name(None) is None
 
 
-def test_build_spec_sorts_doors_and_reads_pin() -> None:
-    s = spec(description="PIN: 4821")
-    assert s.door_ids == ("door-a", "door-b")
-    assert s.pin == "4821"
-    assert (s.first_name, s.last_name) == ("Jane", "Doe")
+def test_name_line_wins_over_title() -> None:
+    s = spec(summary="Cleaning", description="NAME: Rosa Diaz\nPIN: 4821")
+    assert (s.first_name, s.last_name, s.pin) == ("Rosa", "Diaz", "4821")
+    s = spec(summary="Cleaning", description="NAME:   ")
+    assert (s.first_name, s.last_name) == ("Cleaning", "Guest")
 
 
-def test_event_key_follows_uid_not_time_or_title() -> None:
-    moved = item(start=NOW + 5 * HOUR, end=NOW + 6 * HOUR, summary="Jane Q Doe")
-    assert event_key(CAL, item()) == event_key(CAL, moved)
-    assert event_key(CAL, item()) != event_key("calendar.other", item())
-    # Each occurrence of a recurring event is its own visit.
-    assert event_key(CAL, item(recurrence_id="20261101")) != event_key(
-        CAL, item(recurrence_id="20261108")
+def test_unusable_events_are_skipped() -> None:
+    result, skipped = specs(item(summary="  "), item(start=NOW + HOUR, end=NOW + HOUR, uid="u2"))
+    assert result == [] and skipped == 2
+
+
+def test_ended_events_are_dropped_not_skipped() -> None:
+    result, skipped = specs(item(start=NOW - 2 * HOUR, end=NOW - HOUR))
+    assert result == [] and skipped == 0
+
+
+def test_doors_sorted() -> None:
+    assert spec().door_ids == ("door-a", "door-b")
+
+
+# --- grouping and the rolling window -------------------------------------
+
+
+def weekly(n: int, *, description=None, start=NOW + HOUR, summary="Cleaner"):
+    return [
+        item(summary=summary, start=start + w * 7 * DAY, uid="series-1",
+             recurrence_id=f"week{w}", description=description)
+        for w in range(n)
+    ]
+
+
+def test_series_is_one_guest_holding_the_next_occurrence() -> None:
+    [s], _ = specs(*weekly(4))
+    assert (s.start, s.end) == (NOW + HOUR, NOW + 2 * HOUR)
+    assert s.later == 3
+
+
+def test_window_rolls_to_the_next_occurrence() -> None:
+    occurrences = weekly(3)
+    [first], _ = specs(*occurrences)
+    [rolled], _ = specs(*occurrences, now=NOW + 3 * HOUR)
+    assert rolled.key == first.key
+    assert (rolled.start, rolled.later) == (NOW + HOUR + 7 * DAY, 1)
+
+
+def test_open_occurrence_is_the_window() -> None:
+    [s], _ = specs(*weekly(2), now=NOW + HOUR + 60)
+    assert s.start == NOW + HOUR  # already started, still open
+
+
+def test_same_pin_groups_separate_events() -> None:
+    a = item(summary="Jane Doe", uid="a", description="PIN: 4821")
+    b = item(summary="Jane Doe", start=NOW + 3 * DAY, uid="b", description="PIN: 4821")
+    c = item(summary="Sam Lee", uid="c", description="PIN: 1111")
+    result, _ = specs(a, b, c)
+    assert sorted((s.name, s.later) for s in result) == [("Jane Doe", 1), ("Sam Lee", 0)]
+
+
+def test_without_a_pin_separate_events_stay_separate() -> None:
+    a = item(uid="a")
+    b = item(start=NOW + 3 * DAY, uid="b")
+    result, _ = specs(a, b)
+    assert len(result) == 2
+
+
+def test_overlapping_and_touching_occurrences_merge() -> None:
+    pin = "PIN: 4821"
+    a = item(start=NOW + HOUR, end=NOW + 3 * HOUR, uid="a", description=pin)
+    b = item(start=NOW + 2 * HOUR, end=NOW + 4 * HOUR, uid="b", description=pin)
+    c = item(start=NOW + 4 * HOUR, end=NOW + 5 * HOUR, uid="c", description=pin)
+    d = item(start=NOW + 9 * HOUR, end=NOW + 10 * HOUR, uid="d", description=pin)
+    [s], _ = specs(d, c, b, a)
+    assert (s.start, s.end, s.later) == (NOW + HOUR, NOW + 5 * HOUR, 1)
+
+
+def test_guest_named_by_its_current_occurrence() -> None:
+    a = item(summary="Jane Doe", uid="a", description="PIN: 4821")
+    b = item(summary="Jane Q Doe", start=NOW + 3 * DAY, uid="b", description="PIN: 4821")
+    [s], _ = specs(b, a)
+    assert s.name == "Jane Doe"
+
+
+def test_guest_key() -> None:
+    a = item(uid="a")
+    # A series keeps its key whatever its title or time.
+    assert guest_key(CAL, a, None, SECRET) == guest_key(
+        CAL, item(uid="a", summary="X Y", start=NOW + DAY), None, SECRET
     )
-
-
-def test_event_key_without_uid_uses_title_and_start() -> None:
-    a = item(uid=None)
-    assert event_key(CAL, a) == event_key(CAL, item(uid=None))
-    assert event_key(CAL, a) != event_key(CAL, item(uid=None, start=NOW + 2))
+    assert guest_key(CAL, a, None, SECRET) != guest_key("calendar.other", a, None, SECRET)
+    # Without a uid, title and start stand in.
+    no_uid = item(uid=None)
+    assert guest_key(CAL, no_uid, None, SECRET) != guest_key(
+        CAL, item(uid=None, start=NOW + 2), None, SECRET
+    )
+    # A PIN outranks the series, and its key is keyed by the entry secret.
+    assert guest_key(CAL, a, "4821", SECRET) == guest_key(CAL, item(uid="z"), "4821", SECRET)
+    assert guest_key(CAL, a, "4821", SECRET) != guest_key(CAL, a, "4821", "t" * 32)
+    assert guest_key(CAL, a, "4821", SECRET) != guest_key(CAL, a, None, SECRET)
 
 
 def test_marker_round_trip_and_hides_pin() -> None:
     s = spec(description="PIN: 4821")
-    remarks = make_remarks(ENTRY, s, SECRET)
+    remarks = make_remarks(ENTRY, s)
     assert "4821" not in remarks
     marker = parse_marker(remarks)
-    assert marker is not None
     assert (marker.entry_id, marker.key, marker.spec) == (ENTRY, s.key, s.spec_digest())
-    assert marker.pin == pin_digest(SECRET, "4821")
     assert parse_marker("Visiting for the interview") is None
     assert parse_marker("") is None
-
-
-def test_pin_digest_is_keyed() -> None:
-    assert pin_digest("a" * 32, "4821") != pin_digest("b" * 32, "4821")
-    assert pin_digest(SECRET, None) == pin_digest(SECRET, "")
 
 
 # --- planning -------------------------------------------------------------
 
 
-def test_new_event_is_created() -> None:
+def test_new_guest_is_created() -> None:
     s = spec()
     result = run([s], [])
     assert result.creates == [s]
@@ -141,80 +228,76 @@ def test_matching_visitor_is_unchanged() -> None:
 
 def test_moved_event_updates_its_visitor() -> None:
     old = spec()
-    new = spec(start=NOW + 3 * HOUR, end=NOW + 4 * HOUR)
+    new = spec(start=NOW + 3 * HOUR)
     result = run([new], [visitor_for(old)])
-    assert [u.spec for u in result.updates] == [new]
-    assert not result.updates[0].set_pin
+    assert result.updates == [(visitor_for(old), new)]
     assert not result.creates and not result.deletes
+
+
+def test_ended_visitor_rolls_to_the_next_occurrence() -> None:
+    occurrences = weekly(2)
+    [first], _ = specs(*occurrences)
+    later = NOW + 3 * HOUR
+    [rolled], _ = specs(*occurrences, now=later)
+    result = run([rolled], [visitor_for(first)], now=later)
+    assert [s for _, s in result.updates] == [rolled]
+    assert not result.creates and not result.ended
 
 
 def test_door_change_updates_via_spec_digest() -> None:
     s = spec()
-    narrowed = build_spec(CAL, item(), ["door-a"])
+    [narrowed], _ = specs(item(), doors=["door-a"])
     result = run([narrowed], [visitor_for(s)])
-    assert [u.spec for u in result.updates] == [narrowed]
+    assert [n for _, n in result.updates] == [narrowed]
 
 
 def test_edit_on_the_controller_is_reverted() -> None:
     s = spec()
-    result = run([s], [visitor_for(s, end=s.end + HOUR)])
-    assert [u.spec for u in result.updates] == [s]
-    result = run([s], [visitor_for(s, first="Janet")])
-    assert [u.spec for u in result.updates] == [s]
+    assert [n for _, n in run([s], [visitor_for(s, end=s.end + HOUR)]).updates] == [s]
+    assert [n for _, n in run([s], [visitor_for(s, first="Janet")]).updates] == [s]
 
 
-def test_pin_change_sets_pin() -> None:
+def test_changed_pin_replaces_the_visitor() -> None:
     old = spec(description="PIN: 1111")
     new = spec(description="PIN: 2222")
-    result = run([new], [visitor_for(old)])
-    assert result.updates[0].set_pin
-    removed = spec()
-    result = run([removed], [visitor_for(old)])
-    assert result.updates[0].set_pin
-    assert result.updates[0].spec.pin is None
-
-
-def test_removed_upcoming_event_deletes_visitor() -> None:
-    s = spec()
-    v = visitor_for(s)
-    result = run([], [v])
+    v = visitor_for(old)
+    result = run([new], [v])
     assert result.deletes == [v]
+    assert result.creates == [new]
 
 
-def test_removed_event_in_progress_deletes_visitor() -> None:
-    s = spec(start=NOW - HOUR, end=NOW + HOUR)
-    v = visitor_for(s)
+def test_removed_upcoming_guest_is_deleted() -> None:
+    v = visitor_for(spec())
     assert run([], [v]).deletes == [v]
 
 
-def test_ended_visit_is_kept_as_history() -> None:
-    s = spec(start=NOW - 3 * HOUR, end=NOW - HOUR)
-    v = visitor_for(s)
-    # Still on the calendar or not, an ended visit is left alone.
-    for desired in ([s], []):
-        result = run(desired, [v])
-        assert result.is_empty
-        assert result.ended == [v]
+def test_removed_guest_in_progress_is_deleted() -> None:
+    v = visitor_for(spec(start=NOW - HOUR, end=NOW + HOUR))
+    assert run([], [v]).deletes == [v]
 
 
-def test_visit_past_the_horizon_is_left_alone() -> None:
-    s = spec(start=HORIZON + HOUR, end=HORIZON + 2 * HOUR)
+def test_ended_visit_with_nothing_left_is_kept_as_history() -> None:
+    s = VisitSpec("a" * 16, "Jane", "Doe", NOW - 3 * HOUR, NOW - HOUR, ("d",), None)
     v = visitor_for(s)
     result = run([], [v])
     assert result.is_empty
+    assert result.ended == [v]
+
+
+def test_visit_past_the_horizon_is_left_alone() -> None:
+    v = visitor_for(spec(start=HORIZON + HOUR))
+    assert run([], [v]).is_empty
 
 
 def test_visitors_of_other_entries_or_people_are_ignored() -> None:
     s = spec()
     other_entry = visitor_for(s, vid="v2", entry="01JOTHERENTRY000000000000B")
     hand_made = visitor_for(s, vid="v3", remarks="Plumber, let in at 9")
-    result = run([], [other_entry, hand_made])
-    assert result.is_empty
-    result = run([s], [other_entry, hand_made])
-    assert result.creates == [s]
+    assert run([], [other_entry, hand_made]).is_empty
+    assert run([s], [other_entry, hand_made]).creates == [s]
 
 
-def test_duplicate_visitor_for_one_event_is_deleted() -> None:
+def test_duplicate_visitor_for_one_guest_is_deleted() -> None:
     s = spec()
     first, second = visitor_for(s, vid="v1"), visitor_for(s, vid="v2")
     result = run([s], [first, second])

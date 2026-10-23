@@ -36,7 +36,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: GuestsConfigEntry) -> bo
 
 async def async_unload_entry(hass: HomeAssistant, entry: GuestsConfigEntry) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        entry.runtime_data.dismiss_notifications()
+    return unloaded
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: GuestsConfigEntry) -> None:

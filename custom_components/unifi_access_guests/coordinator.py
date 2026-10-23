@@ -1,4 +1,4 @@
-"""Sync coordinator: read the calendar, plan, apply."""
+"""Sync coordinator: read the calendar, plan, apply, report."""
 
 from __future__ import annotations
 
@@ -6,15 +6,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
 
+from homeassistant.components import persistent_notification
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
 from homeassistant.components.calendar.const import DATA_COMPONENT
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import AccessAuthError, AccessClient, AccessError
+from .api import AccessAuthError, AccessClient, AccessError, Visitor
 from .const import (
     CONF_CALENDAR,
     CONF_DOORS,
@@ -25,7 +26,7 @@ from .const import (
     DEFAULT_SCAN_MINUTES,
     DOMAIN,
 )
-from .sync import CalendarItem, Plan, VisitSpec, build_spec, plan, visitor_body
+from .sync import CalendarItem, Plan, VisitSpec, build_specs, parse_marker, plan, visitor_body
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +41,23 @@ class VisitSummary:
     start: datetime
     end: datetime
     has_pin: bool
+    later: int
+
+
+@dataclass(frozen=True, slots=True)
+class VisitError:
+    """A guest the last pass could not bring in line."""
+
+    key: str
+    name: str
+    start: datetime | None
+    action: str
+    reason: str
+
+    def describe(self) -> str:
+        """One line for the sensor and the log."""
+        when = f" ({dt_util.as_local(self.start):%a %d %b %H:%M})" if self.start else ""
+        return f"{self.name}{when}: could not {self.action}: {self.reason}"
 
 
 @dataclass(slots=True)
@@ -52,7 +70,7 @@ class SyncResult:
     updated: int = 0
     deleted: int = 0
     skipped_events: int = 0
-    errors: list[str] = field(default_factory=list)
+    errors: list[VisitError] = field(default_factory=list)
 
 
 class CalendarUnavailable(Exception):
@@ -85,6 +103,24 @@ async def fetch_events(
         raise CalendarUnavailable(f"{entity_id}: {err}") from err
 
 
+def _ts(seconds: int) -> datetime:
+    return dt_util.utc_from_timestamp(seconds)
+
+
+def _summary(spec: VisitSpec) -> VisitSummary:
+    return VisitSummary(
+        name=spec.name,
+        start=_ts(spec.start),
+        end=_ts(spec.end),
+        has_pin=spec.pin is not None,
+        later=spec.later,
+    )
+
+
+def _spec_error(spec: VisitSpec, action: str, err: AccessError) -> VisitError:
+    return VisitError(spec.key, spec.name, _ts(spec.start), action, err.reason)
+
+
 class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
     """Each refresh is one full sync pass."""
 
@@ -105,6 +141,8 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
         )
         self.client = client
         self.last_plan: Plan | None = None
+        # Guest key -> text of the notification currently shown for it.
+        self._notified: dict[str, str] = {}
 
     @property
     def calendar_entity_id(self) -> str:
@@ -132,19 +170,15 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
         except AccessError as err:
             raise UpdateFailed(str(err)) from err
 
-        door_ids: list[str] = entry.options.get(CONF_DOORS, [])
-        desired: list[VisitSpec] = []
-        skipped = 0
-        for event in events:
-            spec = build_spec(self.calendar_entity_id, to_item(event), door_ids)
-            if spec is None:
-                skipped += 1
-            else:
-                desired.append(spec)
-
+        desired, skipped = build_specs(
+            calendar_entity_id=self.calendar_entity_id,
+            items=[to_item(event) for event in events],
+            door_ids=entry.options.get(CONF_DOORS, []),
+            secret=entry.data[CONF_SECRET],
+            now=int(now.timestamp()),
+        )
         work = plan(
             entry_id=entry.entry_id,
-            secret=entry.data[CONF_SECRET],
             desired=desired,
             visitors=visitors,
             now=int(now.timestamp()),
@@ -161,17 +195,17 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
         result.visits.sort(key=lambda v: v.start)
         result.finished = dt_util.now()
         for error in result.errors:
-            _LOGGER.warning("Sync of %s: %s", self.calendar_entity_id, error)
+            _LOGGER.warning("Sync of %s: %s", self.calendar_entity_id, error.describe())
+        self._notify(result.errors)
         return result
 
     async def _apply(self, work: Plan, result: SyncResult) -> None:
         """Carry out a plan. One failed visitor never stops the others.
 
-        Deletes go first, so a PIN freed by a removed visit is available to a
-        visit created in the same pass.
+        Deletes go first, so a PIN freed by a removed guest is available to a
+        guest created in the same pass.
         """
         entry_id = self.config_entry.entry_id
-        secret = self.config_entry.data[CONF_SECRET]
 
         for visitor in work.deletes:
             try:
@@ -180,49 +214,39 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
             except AccessAuthError:
                 raise
             except AccessError as err:
-                result.errors.append(f"delete {visitor.first_name} {visitor.last_name}: {err}")
+                result.errors.append(_visitor_error(visitor, err))
 
-        for update in work.updates:
-            spec = update.spec
+        for visitor, spec in work.updates:
             try:
-                # The PIN goes first: the remarks written next record the new
-                # PIN, so if the PIN fails the old remarks make the next pass
-                # retry it.
-                if update.set_pin:
-                    await self.client.set_visitor_pin(update.visitor.id, spec.pin)
-                await self.client.update_visitor(
-                    update.visitor.id, visitor_body(entry_id, spec, secret)
-                )
+                await self.client.update_visitor(visitor.id, visitor_body(entry_id, spec))
                 result.updated += 1
                 result.visits.append(_summary(spec))
             except AccessAuthError:
                 raise
             except AccessError as err:
-                result.errors.append(f"update {spec.name}: {err}")
+                result.errors.append(_spec_error(spec, "update the visit", err))
 
         for spec in work.creates:
             try:
-                visitor_id = await self.client.create_visitor(
-                    visitor_body(entry_id, spec, secret)
-                )
+                visitor_id = await self.client.create_visitor(visitor_body(entry_id, spec))
             except AccessAuthError:
                 raise
             except AccessError as err:
-                result.errors.append(f"create {spec.name}: {err}")
+                result.errors.append(_spec_error(spec, "create the visit", err))
                 continue
             if spec.pin:
                 try:
                     await self.client.set_visitor_pin(visitor_id, spec.pin)
                 except AccessError as err:
-                    # Its remarks already record the PIN, so leaving it would
-                    # hide the failure from later passes. Remove it and let
-                    # the next pass create it again.
-                    result.errors.append(f"PIN for {spec.name}: {err}")
+                    # The guest key stands for the PIN, so a visitor left
+                    # without it would look correct to every later pass.
+                    # Remove it and let the next pass create it again.
+                    result.errors.append(_spec_error(spec, "set the PIN", err))
                     try:
                         await self.client.delete_visitor(visitor_id)
                     except AccessError as cleanup_err:
                         result.errors.append(
-                            f"remove {spec.name} after PIN failure: {cleanup_err}"
+                            _spec_error(spec, "remove the visit after the PIN failed", cleanup_err)
                         )
                     if isinstance(err, AccessAuthError):
                         raise
@@ -230,11 +254,54 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
             result.created += 1
             result.visits.append(_summary(spec))
 
+    @callback
+    def _notify(self, errors: list[VisitError]) -> None:
+        """One notification per guest with an error; cleared once it syncs.
 
-def _summary(spec: VisitSpec) -> VisitSummary:
-    return VisitSummary(
-        name=spec.name,
-        start=dt_util.utc_from_timestamp(spec.start),
-        end=dt_util.utc_from_timestamp(spec.end),
-        has_pin=spec.pin is not None,
+        A notification is only re-raised when its text changes, so an error
+        that persists does not reappear every pass.
+        """
+        current: dict[str, list[VisitError]] = {}
+        for error in errors:
+            current.setdefault(error.key, []).append(error)
+
+        for key in list(self._notified):
+            if key not in current:
+                persistent_notification.async_dismiss(self.hass, self._notification_id(key))
+                del self._notified[key]
+
+        for key, guest_errors in current.items():
+            message = "\n".join(f"- {e.describe()}" for e in guest_errors)
+            if self._notified.get(key) == message:
+                continue
+            persistent_notification.async_create(
+                self.hass,
+                f"Calendar **{self.config_entry.title}** could not sync a visit to "
+                f"UniFi Access:\n\n{message}\n\nFix the event (for example, give it a "
+                "PIN no one else uses); this clears once the visit syncs.",
+                title="UniFi Access guest not synced",
+                notification_id=self._notification_id(key),
+            )
+            self._notified[key] = message
+
+    @callback
+    def dismiss_notifications(self) -> None:
+        """Clear every notification this entry raised (on unload)."""
+        for key in self._notified:
+            persistent_notification.async_dismiss(self.hass, self._notification_id(key))
+        self._notified.clear()
+
+    def _notification_id(self, key: str) -> str:
+        return f"{DOMAIN}_{self.config_entry.entry_id}_{key}"
+
+
+def _visitor_error(visitor: Visitor, err: AccessError) -> VisitError:
+    marker = parse_marker(visitor.remarks)
+    start = _ts(visitor.start_time) if visitor.start_time is not None else None
+    return VisitError(
+        marker.key if marker else visitor.id,
+        f"{visitor.first_name} {visitor.last_name}",
+        start,
+        "remove the visit",
+        err.reason,
     )
