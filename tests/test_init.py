@@ -59,10 +59,14 @@ async def test_event_becomes_visitor_with_pin(
     assert visitor["last_name"] == "Doe"
     assert visitor["start_time"] == int(start.timestamp())
     assert visitor["end_time"] == int((start + timedelta(hours=2)).timestamp())
-    assert visitor["resources"] == [
+    assert access.sent_resources[vid] == [
         {"id": "door-front", "type": "door"},
         {"id": "door-gate", "type": "door"},
     ]
+    # The controller reads the doors back as a door group made for the
+    # visitor; that must not look like a change on the next pass (see
+    # test_second_pass_changes_nothing).
+    assert [r["type"] for r in visitor["resources"]] == ["door_group"]
     assert parse_marker(visitor["remarks"]).entry_id == config_entry.entry_id
     assert access.pins == {vid: "4821"}
 
@@ -194,7 +198,8 @@ async def test_pin_in_use_elsewhere_notifies_until_fixed(
     assert list(access.visitors) == [other]  # the new visitor was removed
     [note] = notifications(hass).values()
     assert "Jane Doe" in note["message"]
-    assert "PIN already in use" in note["message"]
+    assert "another user or visitor already has this PIN" in note["message"]
+    assert "Server system error." in note["message"]  # the controller's own words
     assert "4821" not in note["message"]
     assert any("set the PIN" in e for e in hass.states.get(VISITS).attributes["errors"])
 

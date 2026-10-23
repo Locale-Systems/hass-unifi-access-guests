@@ -116,6 +116,8 @@ async def run(
     """Run every check, always cleaning up. Returns the verdicts."""
     steps: list[Step] = []
     created: list[str] = []
+    # Every door group a probe visitor was seen holding (see step 5b).
+    groups: set[str] = set()
 
     def step(name: str) -> Step:
         steps.append(Step(name))
@@ -140,6 +142,7 @@ async def run(
             s.verdict, s.detail = "FAIL", f"created {a_id} but it is not in the visitor list"
         else:
             show(got)
+            groups.update(door_groups_of(got))
             if (got.start_time, got.end_time) == (a.start, a.end):
                 s.verdict, s.detail = "PASS", "start_time and end_time came back unchanged"
             else:
@@ -170,6 +173,7 @@ async def run(
         else:
             t = int(now())
             b = spec(2, door, t + 24 * HOUR, t + 25 * HOUR)
+            b_id = None
             try:
                 b_id = await client.create_visitor(visitor_body(PROBE_ENTRY, b))
                 created.append(b_id)
@@ -180,8 +184,23 @@ async def run(
                     "still safe, but the duplicate-PIN premise is wrong"
                 )
             except AccessError as err:
-                s.verdict = "PASS"
-                s.detail = f"refused: code={err.code!r} reason={err.reason!r} ({err})"
+                refusal = f"code={err.code!r} reason={err.reason!r} ({err})"
+                if b_id is None:
+                    s.verdict, s.detail = "FAIL", f"could not create the second visitor: {refusal}"
+                else:
+                    # Control: the same visitor takes a PIN nobody holds, so
+                    # the refusal was about the duplicate, not the visitor.
+                    fresh = f"{(int(pin) + 1) % 10 ** len(pin):0{len(pin)}d}"
+                    try:
+                        await client.set_visitor_pin(b_id, fresh)
+                        s.verdict = "PASS"
+                        s.detail = f"refused; a different PIN on the same visitor was accepted. {refusal}"
+                    except AccessError as control_err:
+                        s.verdict = "FAIL"
+                        s.detail = (
+                            f"refused, but a different PIN was refused too ({control_err}), "
+                            f"so the refusal is not shown to be about the duplicate. {refusal}"
+                        )
             say(f"    {s.verdict}: {s.detail}")
 
         # 4. The door, while visitor 1's window is open.
@@ -217,23 +236,48 @@ async def run(
             if wait > 0:
                 await sleep(wait)
             ended = await find(client, c_id)
+            before: set[str] = set()
             if ended is not None:
+                before = door_groups_of(ended)
+                groups.update(before)
                 say(f"    status after it ended: {ended.status!r}")
             t = int(now())
             rolled = VisitSpec(c.key, c.first_name, c.last_name, t + 24 * HOUR,
                                t + 25 * HOUR, c.door_ids, None)
+            moved = False
             try:
                 await client.update_visitor(c_id, visitor_body(PROBE_ENTRY, rolled))
                 got = await find(client, c_id)
                 if got is not None:
                     show(got)
+                    groups.update(door_groups_of(got))
                 if got is not None and (got.start_time, got.end_time) == (rolled.start, rolled.end):
                     s.verdict = "PASS"
                     s.detail = f"moved; status now {got.status!r}"
+                    moved = True
                 else:
                     s.verdict, s.detail = "FAIL", "update accepted but the window did not move"
             except AccessError as err:
                 s.verdict, s.detail = "FAIL", f"update refused: {err}"
+            say(f"    {s.verdict}: {s.detail}")
+
+            # 5b. The controller turns the doors sent into a door group per
+            # visitor. The rolling window updates once per occurrence, so a
+            # group left behind by each update would pile up.
+            s = step("An update leaves no door group behind")
+            after = door_groups_of(got) if moved and got is not None else set()
+            replaced = before - after
+            if not moved:
+                s.detail = "skipped: the update did not go through"
+            elif not before:
+                s.verdict, s.detail = "INFO", "the visitor had no door group to compare"
+            elif not replaced:
+                s.verdict, s.detail = "PASS", "the update kept the same door group"
+            else:
+                states = {g: await door_group_state(client, g) for g in replaced}
+                s.verdict, s.detail = _group_verdict(states, "the update made a new group and left the old one")
+                if s.verdict == "PASS":
+                    s.detail = "the update replaced the group and removed the old one"
         say(f"    {s.verdict}: {s.detail}")
 
         # 6. Paging gives the same visitors as one big page.
@@ -253,8 +297,63 @@ async def run(
             s.detail = f"unpaged {len(everyone)}, paged {len(paged)} ({len(set(paged))} distinct)"
         say(f"    {s.verdict}: {s.detail}")
     finally:
+        for visitor in await _probe_visitors(client):
+            groups.update(door_groups_of(visitor))
         await cleanup(client, steps)
+        s = step("Deleting a visitor removes its door group")
+        if not groups:
+            s.verdict, s.detail = "INFO", "no door groups were seen"
+        else:
+            states = {g: await door_group_state(client, g) for g in sorted(groups)}
+            s.verdict, s.detail = _group_verdict(states, "left after their visitors were deleted")
+            if s.verdict == "FAIL":
+                s.detail += "; delete them in the Access app"
+        say(f"    {s.verdict}: {s.detail}")
     return steps
+
+
+def door_groups_of(visitor: Visitor) -> set[str]:
+    """Ids of the door groups a visitor's resources read back as."""
+    return {
+        str(r["id"])
+        for r in visitor.raw.get("resources") or []
+        if isinstance(r, dict) and r.get("type") == "door_group" and r.get("id")
+    }
+
+
+async def door_group_state(client: AccessClient, group_id: str) -> str:
+    """'exists', 'gone', or 'unknown: <error>' for GET /door_groups/{id}.
+
+    Only a 404 or a not-found code counts as gone: how this controller says
+    "no such group" is itself unverified, and an error must never pass for
+    a clean-up. Uses the client's private request helper because the
+    integration has no reason to read door groups.
+    """
+    try:
+        await client._request("GET", f"/api/v1/developer/door_groups/{group_id}")  # noqa: SLF001
+    except AccessError as err:
+        code = (err.code or "").upper()
+        if err.reason == "HTTP 404" or "NOT_FOUND" in code or "NOT_EXIST" in code:
+            return "gone"
+        return f"unknown: {err}"
+    return "exists"
+
+
+def _group_verdict(states: dict[str, str], what: str) -> tuple[str, str]:
+    still = [g for g, st in states.items() if st == "exists"]
+    unknown = {g: st for g, st in states.items() if st.startswith("unknown")}
+    if still:
+        return "FAIL", f"{what}: {len(still)} of {len(states)} still exist: {still}"
+    if unknown:
+        return "INFO", f"could not tell for {len(unknown)}: {unknown}"
+    return "PASS", f"all {len(states)} gone"
+
+
+async def _probe_visitors(client: AccessClient) -> list[Visitor]:
+    try:
+        return [v for v in await client.list_visitors() if is_probe(v)]
+    except AccessError:
+        return []
 
 
 async def cleanup(client: AccessClient, steps: list[Step]) -> None:
@@ -311,7 +410,9 @@ async def explain_rejected_token(client: AccessClient, host: str, token: str) ->
 
 async def terminal_door_check(pin: str, end: int) -> None:
     say(f"    The window is open until {when(end)}.")
-    say(f"    Enter PIN {pin} at the door now, and check the visit in the Access app.")
+    say(f"    Enter PIN {pin} at the door now: it should open.")
+    say("    Then try it at a door you did NOT pick: it should be refused.")
+    say("    Check the visit in the Access app too.")
     await asyncio.to_thread(input, "    Press Enter when done... ")
 
 

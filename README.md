@@ -93,20 +93,34 @@ for the front door and a "Pool guests" calendar for the gate.
 - **Last sync**: when the last pass finished.
 - **Sync now**: a button that runs a pass immediately.
 
-## Not yet verified on a real controller
+## Checked on a real controller
 
-This was built from the Access API reference and tested against a simulated
-controller. Check these on a real one before relying on it:
+The first probe run (2026-10-23, `tools/probe_controller.py` below) confirmed:
 
-- visit times are sent as Unix seconds;
-- a visitor with a start and end time but no weekly schedule can open its doors
-  for the whole window;
+- visit times are Unix seconds, and read back unchanged;
 - PINs are set and removed at `/visitors/{id}/pin_codes`;
-- a visitor whose window has ended can be moved to a later window with an
-  update (this is how the rolling window works);
-- the controller refuses a PIN that another user or visitor already holds, and
-  what its error code and message are. Expect a notification; the pass then
-  removes the new visitor and retries next time.
+- a visitor whose window has ended (status `NO_VISIT`) can be moved to a later
+  window, and goes back to `UPCOMING`. This is how the rolling window works;
+- the visitor list pages correctly;
+- a PIN another visitor holds is refused, but only with the generic
+  `CODE_SYSTEM_ERROR` / "Server system error.". The notification therefore
+  says the PIN is *most likely* in use and quotes the controller.
+
+It also showed that the controller turns the doors sent with a visitor into a
+door group made for that visitor (`visitor-<timestamp>`), and that an update
+gives the visitor a new group. The integration never compares the doors it
+reads back, so this doesn't make every pass see a change.
+
+Still to check (the probe now covers the first two):
+
+- whether an update or a delete leaves the visitor's old door group behind.
+  The rolling window updates once per occurrence, so leftovers would pile up;
+- that the duplicate-PIN refusal really is about the duplicate: the probe now
+  sets a different PIN on the same visitor as a control;
+- that the PIN opens the chosen door for the whole window, and no other door
+  (by hand at the door, while the probe pauses);
+- a repeating event, and two events with the same PIN, as one visitor that
+  moves on after each visit (in Home Assistant).
 
 Known limit: two config entries (two calendars) on the same controller don't
 know about each other's guests, so the same PIN on both still collides.

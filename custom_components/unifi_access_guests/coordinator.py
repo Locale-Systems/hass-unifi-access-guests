@@ -121,6 +121,22 @@ def _spec_error(spec: VisitSpec, action: str, err: AccessError) -> VisitError:
     return VisitError(spec.key, spec.name, _ts(spec.start), action, err.reason)
 
 
+def _pin_error(spec: VisitSpec, err: AccessError) -> VisitError:
+    """A refused PIN, explained.
+
+    A real controller refuses a PIN another user or visitor already holds with
+    the generic CODE_SYSTEM_ERROR / "Server system error." (LOC-304 probe,
+    2026-10-23), which on its own tells nobody what to fix.
+    """
+    reason = err.reason
+    if err.code == "CODE_SYSTEM_ERROR":
+        reason = (
+            "UniFi Access refused it, most likely because another user or visitor "
+            f'already has this PIN (it said "{err.reason}")'
+        )
+    return VisitError(spec.key, spec.name, _ts(spec.start), "set the PIN", reason)
+
+
 class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
     """Each refresh is one full sync pass."""
 
@@ -242,7 +258,7 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
                     # The guest key stands for the PIN, so a visitor left
                     # without it would look correct to every later pass.
                     # Remove it and let the next pass create it again.
-                    result.errors.append(_spec_error(spec, "set the PIN", err))
+                    result.errors.append(_pin_error(spec, err))
                     try:
                         await self.client.delete_visitor(visitor_id)
                     except AccessError as cleanup_err:

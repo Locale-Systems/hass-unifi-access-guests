@@ -61,8 +61,14 @@ async def test_happy_path(client: AccessClient, access: FakeAccess) -> None:
 
     clock = Clock()
     steps = await run(client, door_check=door_check, clock=clock)
-    assert verdicts(steps) == ["PASS", "PASS", "PASS", "INFO", "PASS", "PASS", "PASS"]
-    assert "PIN already in use" in steps[2].detail
+    assert [(s.name.split(" ")[0], s.verdict) for s in steps] == [
+        ("Create", "PASS"), ("Set,", "PASS"), ("Give", "PASS"), ("Visitor", "INFO"),
+        ("Move", "PASS"), ("An", "PASS"), ("The", "PASS"), ("Delete", "PASS"),
+        ("Deleting", "PASS"),
+    ]
+    assert "CODE_SYSTEM_ERROR" in steps[2].detail
+    assert "a different PIN on the same visitor was accepted" in steps[2].detail
+    assert access.door_groups == {}
     assert checked and checked[0][0] == PIN
     # It waited for visitor 1's window to open, then for visitor 3's to end.
     assert clock.slept[0] == 30 and clock.slept[1] > 60
@@ -148,5 +154,49 @@ async def test_rejected_token_checklist_flags_whitespace(
 async def test_refused_create_still_cleans_up(client: AccessClient, access: FakeAccess) -> None:
     access.fail["POST visitors"] = "code"
     steps = await run(client)
-    assert [s.verdict for s in steps] == ["FAIL", "PASS"]
+    assert [s.verdict for s in steps] == ["FAIL", "PASS", "INFO"]
     assert access.visitors == {}
+
+
+def step_named(steps, prefix: str):
+    [s] = [s for s in steps if s.name.startswith(prefix)]
+    return s
+
+
+async def test_refusing_any_pin_fails_the_duplicate_control(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    # Visitor 2 takes no PIN at all: the refusal is not about duplication.
+    access.refuse_pin = lambda vid, pin: access.visitors[vid]["last_name"] == "Visitor 2"
+    s = step_named(await run(client), "Give a second visitor")
+    assert s.verdict == "FAIL"
+    assert "not shown to be about the duplicate" in s.detail
+
+
+async def test_door_group_left_by_an_update_fails(client: AccessClient, access: FakeAccess) -> None:
+    access.leak_groups_on_update = True
+    steps = await run(client)
+    s = step_named(steps, "An update leaves")
+    assert s.verdict == "FAIL" and "left the old one" in s.detail
+    assert step_named(steps, "Deleting a visitor").verdict == "FAIL"
+
+
+async def test_door_group_left_by_a_delete_fails(client: AccessClient, access: FakeAccess) -> None:
+    access.leak_groups_on_delete = True
+    steps = await run(client)
+    assert step_named(steps, "An update leaves").verdict == "PASS"
+    s = step_named(steps, "Deleting a visitor")
+    assert s.verdict == "FAIL" and "delete them in the Access app" in s.detail
+    # Visitors 1, 2 and 3 (after its update) each left a group; visitor 3's
+    # pre-update group went with the update.
+    assert "3 of 4 still exist" in s.detail
+
+
+async def test_unreadable_door_groups_are_unknown_not_gone(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    access.door_group_lookup_error = "CODE_SYSTEM_ERROR"
+    steps = await run(client)
+    for prefix in ("An update leaves", "Deleting a visitor"):
+        s = step_named(steps, prefix)
+        assert s.verdict == "INFO" and "could not tell" in s.detail

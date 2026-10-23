@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from datetime import datetime
 import itertools
 import re
@@ -69,6 +69,38 @@ class FakeAccess:
         self.os_key_for: str | None = None
         self.calls: list[tuple[str, str, Any]] = []
         self._ids = (f"visitor-{n}" for n in itertools.count(1))
+        # As on a real controller (LOC-304 probe, 2026-10-23), the doors sent
+        # with a visitor become a door group made for it, and the visitor
+        # reads back with that group. Set either flag to leave groups behind.
+        self.door_groups: dict[str, dict[str, Any]] = {}
+        self.sent_resources: dict[str, list[dict[str, Any]]] = {}
+        self.leak_groups_on_update = False
+        self.leak_groups_on_delete = False
+        # An envelope error code for every door group lookup, when set.
+        self.door_group_lookup_error: str | None = None
+        # Extra PIN rule: refuse when this returns True for (visitor id, pin).
+        self.refuse_pin: Callable[[str, str], bool] | None = None
+        self._group_ids = (f"group-{n}" for n in itertools.count(1))
+
+    def _store_resources(self, visitor_id: str, data: dict[str, Any]) -> None:
+        """Turn the doors in a create/update body into a fresh door group."""
+        if "resources" not in data:
+            return
+        visitor = self.visitors[visitor_id]
+        self.sent_resources[visitor_id] = data["resources"]
+        old = [r["id"] for r in visitor.get("resources") or [] if r.get("type") == "door_group"]
+        group_id = next(self._group_ids)
+        self.door_groups[group_id] = {
+            "id": group_id,
+            "name": f"visitor-{group_id}",
+            "resources": data["resources"],
+        }
+        visitor["resources"] = [
+            {"id": group_id, "name": f"visitor-{group_id}", "type": "door_group"}
+        ]
+        if not self.leak_groups_on_update:
+            for group in old:
+                self.door_groups.pop(group, None)
 
     def add_visitor(self, **fields: Any) -> str:
         visitor_id = next(self._ids)
@@ -113,30 +145,43 @@ class FakeAccess:
             items = list(self.visitors.values())[(page - 1) * size : page * size]
             return self._ok(method, url, items)
         if path == "visitors" and method == "POST":
-            visitor_id = self.add_visitor(**data)
+            visitor_id = self.add_visitor(**{k: v for k, v in data.items() if k != "resources"})
+            self._store_resources(visitor_id, data)
             return self._ok(method, url, self.visitors[visitor_id])
+        if parts[0] == "door_groups" and len(parts) == 2 and method == "GET":
+            if self.door_group_lookup_error:
+                return self._response(method, url, code=self.door_group_lookup_error, msg="nope")
+            group = self.door_groups.get(parts[1])
+            return self._ok(method, url, group) if group else self._response(method, url, status=404)
         if parts[0] == "visitors" and len(parts) == 2:
             visitor_id = parts[1]
             if visitor_id not in self.visitors:
                 return self._response(method, url, status=404)
             if method == "PUT":
-                self.visitors[visitor_id].update(data)
+                self.visitors[visitor_id].update(
+                    {k: v for k, v in data.items() if k != "resources"}
+                )
+                self._store_resources(visitor_id, data)
                 return self._ok(method, url, self.visitors[visitor_id])
             if method == "DELETE":
                 assert url.query.get("is_force") == "true"
-                del self.visitors[visitor_id]
+                visitor = self.visitors.pop(visitor_id)
                 self.pins.pop(visitor_id, None)
+                if not self.leak_groups_on_delete:
+                    for r in visitor.get("resources") or []:
+                        self.door_groups.pop(r["id"], None)
                 return self._ok(method, url)
         if parts[0] == "visitors" and parts[2:] == ["pin_codes"]:
             visitor_id = parts[1]
             if method == "PUT":
-                # The controller lets a PIN belong to one credential holder.
-                # The real error code is unverified; this one is made up.
-                if self.unique_pins and any(
+                # A PIN belongs to one credential holder. A real controller
+                # refuses a duplicate with this generic error (LOC-304 probe,
+                # 2026-10-23), not a PIN-specific code.
+                if (self.unique_pins and any(
                     p == data["pin_code"] for v, p in self.pins.items() if v != visitor_id
-                ):
+                )) or (self.refuse_pin and self.refuse_pin(visitor_id, data["pin_code"])):
                     return self._response(
-                        method, url, code="CODE_PIN_IN_USE", msg="PIN already in use"
+                        method, url, code="CODE_SYSTEM_ERROR", msg="Server system error."
                     )
                 self.pins[visitor_id] = data["pin_code"]
             else:
