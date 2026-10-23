@@ -202,8 +202,9 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
     async def _apply(self, work: Plan, result: SyncResult) -> None:
         """Carry out a plan. One failed visitor never stops the others.
 
-        Deletes go first, so a PIN freed by a removed guest is available to a
-        guest created in the same pass.
+        The order doesn't matter for PINs: guests are keyed by PIN, so a PIN
+        moving between events stays with one visitor and is never deleted
+        and recreated in one pass.
         """
         entry_id = self.config_entry.entry_id
 

@@ -90,6 +90,8 @@ def test_parse_name() -> None:
     # HTML: the name ends with its paragraph, and entities decode.
     assert parse_name("<p>NAME: Zo&euml; Hart</p><p>PIN: 4821</p>") == "Zoë Hart"
     assert parse_name("<b>Name:</b>&nbsp;Bo Ray<br>PIN: 1234") == "Bo Ray"
+    assert parse_name("<p>NAME: Jane Doe</p><p>Arrives at 3</p>") == "Jane Doe"
+    assert parse_name("NAME: Jane Doe<br/>Gate code is on the fridge") == "Jane Doe"
     # Needs the colon, and the whole word.
     assert parse_name("Name the dog") is None
     assert parse_name("USERNAME: jdoe") is None
