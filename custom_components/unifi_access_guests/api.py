@@ -26,6 +26,13 @@ VISITORS_PATH = "/api/v1/developer/visitors"
 VISITOR_PATH = "/api/v1/developer/visitors/{visitor_id}"
 VISITOR_PIN_PATH = "/api/v1/developer/visitors/{visitor_id}/pin_codes"
 
+# Endpoints that accept a UniFi OS API key (X-API-KEY) on the console's own
+# port, used only to explain a token the Access API rejected.
+UNIFI_OS_KEY_PROBES = (
+    ("UniFi Network", "/proxy/network/integration/v1/info"),
+    ("UniFi Protect", "/proxy/protect/integration/v1/meta/info"),
+)
+
 # The visitor list is paged. 100 keeps a household's list to one request.
 PAGE_SIZE = 100
 # A guard against a server that ignores page_num and returns page 1 forever.
@@ -121,7 +128,10 @@ class AccessClient:
     def __init__(self, host: str, api_token: str, session: aiohttp.ClientSession) -> None:
         """Initialize the client."""
         self._base = base_url(host)
+        hostname = urlparse(self._base).hostname or ""
+        self._console = f"https://[{hostname}]" if ":" in hostname else f"https://{hostname}"
         self._session = session
+        self._token = api_token
         self._headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -130,6 +140,27 @@ class AccessClient:
         self._timeout = aiohttp.ClientTimeout(
             total=DEFAULT_REQUEST_TIMEOUT.total_seconds()
         )
+
+    async def unifi_os_key_app(self) -> str | None:
+        """Name the app a rejected token works for, if it is a UniFi OS key.
+
+        The usual reason the Access API rejects a token is that it is a
+        UniFi OS API key (Settings → Control Plane → Integrations), made for
+        the Network and Protect integration APIs on the console's own port.
+        Best effort: any failure means "no idea", never an error.
+        """
+        for app, path in UNIFI_OS_KEY_PROBES:
+            try:
+                async with self._session.get(
+                    f"{self._console}{path}",
+                    headers={"X-API-KEY": self._token, "Accept": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 200:
+                        return app
+            except (TimeoutError, aiohttp.ClientError, OSError):
+                continue
+        return None
 
     async def get_doors(self) -> list[Door]:
         """List doors. Also the cheapest call to validate a token."""

@@ -122,6 +122,29 @@ async def test_times_in_another_format_fail_step_one(
     assert access.visitors == {}
 
 
+async def test_rejected_token_explained_as_os_key(
+    client: AccessClient, access: FakeAccess, capsys
+) -> None:
+    access.os_key_for = "UniFi Network"
+    await probe.explain_rejected_token(client, HOST, TOKEN)
+    out = capsys.readouterr().out
+    assert "UniFi OS API key" in out and "UniFi Network" in out
+    assert f"https://{HOST}/access/settings/system" in out
+    assert TOKEN not in out
+
+
+async def test_rejected_token_checklist_flags_whitespace(
+    client: AccessClient, access: FakeAccess, capsys
+) -> None:
+    await probe.explain_rejected_token(client, HOST, "user name\nsecret")
+    out = capsys.readouterr().out
+    assert "not a UniFi OS key" in out
+    assert "CONTAINS WHITESPACE" in out
+    assert "secret" not in out
+    await probe.explain_rejected_token(client, HOST, "abcDEF123-_")
+    assert "letters, digits" in capsys.readouterr().out
+
+
 async def test_refused_create_still_cleans_up(client: AccessClient, access: FakeAccess) -> None:
     access.fail["POST visitors"] = "code"
     steps = await run(client)

@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connect to UniFi Access",
-        "description": "Create an API token in UniFi Access under Settings → General → API Token. The token has full access to UniFi Access, so keep it somewhere safe.",
+        "description": "Create the API token inside UniFi Access (Settings → System → API Token, at https://your-console/access/settings/system), not in UniFi OS's own settings, and give it every permission it offers. Keep it somewhere safe.",
         "data": {
           "host": "Host",
           "api_token": "API token",
@@ -38,6 +38,7 @@
       "invalid_host": "That host is not valid.",
       "no_doors": "UniFi Access reported no doors.",
       "no_doors_selected": "Choose at least one door.",
+      "unifi_os_key": "That is a UniFi OS API key (it works for UniFi Network or Protect). Create the token inside UniFi Access instead: Access → Settings → System → API Token.",
       "unknown": "Unexpected error from UniFi Access."
     },
     "abort": {
@@ -62,6 +63,7 @@
     "abort": {
       "cannot_connect": "Could not reach UniFi Access.",
       "invalid_auth": "The API token was rejected.",
+      "unifi_os_key": "That is a UniFi OS API key (it works for UniFi Network or Protect). Create the token inside UniFi Access instead: Access → Settings → System → API Token.",
       "unknown": "Unexpected error from UniFi Access."
     }
   },

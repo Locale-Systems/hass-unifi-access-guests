@@ -73,6 +73,27 @@ async def test_connection_errors(
     assert result["errors"] == {"base": error}
 
 
+@pytest.mark.parametrize("app", ["UniFi Network", "UniFi Protect"])
+async def test_unifi_os_key_is_named(hass: HomeAssistant, access: FakeAccess, app: str) -> None:
+    access.fail["GET doors"] = 401
+    access.os_key_for = app
+    result = await start(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECTION)
+    assert result["errors"] == {"base": "unifi_os_key"}
+
+
+async def test_reauth_with_a_unifi_os_key(
+    hass: HomeAssistant, access: FakeAccess, calendar: FakeCalendar, config_entry
+) -> None:
+    result = await config_entry.start_reauth_flow(hass)
+    access.fail["GET doors"] = 401
+    access.os_key_for = "UniFi Protect"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_TOKEN: "an-os-key"}
+    )
+    assert result["errors"] == {"base": "unifi_os_key"}
+
+
 async def test_unreachable_controller(hass: HomeAssistant, aioclient_mock) -> None:
     aioclient_mock.get(
         "https://192.0.2.10:12445/api/v1/developer/doors", exc=TimeoutError()

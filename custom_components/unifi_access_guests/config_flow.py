@@ -46,10 +46,27 @@ from .const import (
 
 
 async def _fetch_doors(hass: HomeAssistant, data: Mapping[str, Any]) -> list[Door]:
-    return await build_client(hass, dict(data)).get_doors()
+    """List doors, raising ``UnifiOsKey`` for the commonest wrong token."""
+    client = build_client(hass, dict(data))
+    try:
+        return await client.get_doors()
+    except AccessAuthError:
+        if await client.unifi_os_key_app():
+            raise UnifiOsKey from None
+        raise
+
+
+class UnifiOsKey(AccessAuthError):
+    """The token is a UniFi OS API key, not a UniFi Access one."""
+
+    def __init__(self) -> None:
+        """Initialize the error."""
+        super().__init__("UniFi OS API key given for the Access API")
 
 
 def _error_key(err: AccessError) -> str:
+    if isinstance(err, UnifiOsKey):
+        return "unifi_os_key"
     if isinstance(err, AccessAuthError):
         return "invalid_auth"
     if isinstance(err, AccessConnectionError):

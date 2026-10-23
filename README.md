@@ -69,10 +69,12 @@ calendar event as plain text, so share the calendar accordingly.
 
 ## Setup
 
-1. In UniFi Access, create an API token (Settings → General → API Token).
-   Access has no limited tokens: this one can do anything in UniFi Access,
-   so store it like a password. The integration itself only reads doors
-   and changes the visitors it created.
+1. Create an API token **inside UniFi Access**: Settings → System → API Token,
+   at `https://<console>/access/settings/system`. Give it every permission it
+   offers. A UniFi OS API key (Settings → Control Plane → Integrations) does
+   not work: the Access API rejects it, and setup says so. Store the token
+   like a password. The integration itself only reads doors and changes the
+   visitors it created.
 2. Copy `custom_components/unifi_access_guests` into your Home Assistant
    `config/custom_components/` (or add this repository to HACS), and restart.
 3. Settings → Devices & services → Add integration → **UniFi Access Guests**.

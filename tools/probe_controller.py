@@ -41,6 +41,7 @@ import aiohttp  # noqa: E402
 
 from custom_components.unifi_access_guests import api  # noqa: E402
 from custom_components.unifi_access_guests.api import (  # noqa: E402
+    AccessAuthError,
     AccessClient,
     AccessError,
     Visitor,
@@ -288,6 +289,26 @@ def read_token(ref: str | None) -> str:
     return token
 
 
+async def explain_rejected_token(client: AccessClient, host: str, token: str) -> None:
+    """Say why the Access API rejected the token, as far as can be told."""
+    where = f"https://{host}/access/settings/system"
+    app = await client.unifi_os_key_app()
+    if app:
+        say(f"\nThis is a UniFi OS API key: {app}'s integration API accepts it.")
+        say("The Access developer API needs a token made inside UniFi Access:")
+        say(f"  {where} -> API Token. Give it every permission it offers.")
+        return
+    shape = "letters, digits, - and _ only"
+    if any(c.isspace() for c in token):
+        shape = "CONTAINS WHITESPACE (wrong 1Password field?)"
+    elif not all(c.isalnum() or c in "-_=+/." for c in token):
+        shape = "contains unusual characters (wrong 1Password field?)"
+    say("\nThe token is not a UniFi OS key either. Check that:")
+    say(f"  - it was made in UniFi Access at {where} (not in UniFi OS settings);")
+    say("  - it has not expired (Access tokens can be created with a validity period);")
+    say(f"  - --token-ref names the right field: what it returned is {len(token)} characters, {shape}.")
+
+
 async def terminal_door_check(pin: str, end: int) -> None:
     say(f"    The window is open until {when(end)}.")
     say(f"    Enter PIN {pin} at the door now, and check the visit in the Access app.")
@@ -313,6 +334,10 @@ async def main() -> int:
         client = AccessClient(args.host, token, session)
         try:
             doors = await client.get_doors()
+        except AccessAuthError as err:
+            say(f"Could not list doors: {err}")
+            await explain_rejected_token(client, args.host, token)
+            return 1
         except AccessError as err:
             say(f"Could not list doors: {err}")
             return 1

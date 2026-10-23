@@ -41,6 +41,7 @@ CALENDAR = "calendar.guests"
 DOORS = [{"id": "door-front", "name": "Front Door"}, {"id": "door-gate", "name": "Gate"}]
 
 _API = re.compile(r"^https://192\.0\.2\.10:12445/api/v1/developer/(?P<path>.*)$")
+_CONSOLE = re.compile(r"^https://192\.0\.2\.10/proxy/(network|protect)/integration/")
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +64,9 @@ class FakeAccess:
         self.fail: dict[str, int | str] = {}
         # Refuse a PIN another visitor holds (the controller's assumed rule).
         self.unique_pins = True
+        # Set to "UniFi Network" or "UniFi Protect" to make the token a UniFi
+        # OS key: that app's integration API accepts it (Access still 401s).
+        self.os_key_for: str | None = None
         self.calls: list[tuple[str, str, Any]] = []
         self._ids = (f"visitor-{n}" for n in itertools.count(1))
 
@@ -74,6 +78,13 @@ class FakeAccess:
     def install(self, aioclient_mock: AiohttpClientMocker) -> None:
         for method in ("get", "post", "put", "delete"):
             aioclient_mock.request(method, _API, side_effect=self._handle)
+        aioclient_mock.get(_CONSOLE, side_effect=self._handle_console)
+
+    async def _handle_console(self, method: str, url: URL, data: Any):
+        """UniFi OS integration APIs: accept the token only if it is an OS key."""
+        app = {"network": "UniFi Network", "protect": "UniFi Protect"}[url.parts[2]]
+        ok = app == self.os_key_for
+        return self._response(method, url, status=200 if ok else 401, ok=True)
 
     def _response(self, method: str, url: URL, status: int = 200, **body: Any):
         return AiohttpClientMockResponse(method, url, status=status, json=body or None)

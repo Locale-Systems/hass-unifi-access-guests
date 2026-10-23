@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+
+import aiohttp
 import pytest
 
 from homeassistant.core import HomeAssistant
@@ -74,6 +77,22 @@ async def test_auth_statuses(client: AccessClient, access: FakeAccess, status: i
     access.fail["GET doors"] = status
     with pytest.raises(AccessAuthError):
         await client.get_doors()
+
+
+async def test_unifi_os_key_app(client: AccessClient, access: FakeAccess, aioclient_mock) -> None:
+    assert await client.unifi_os_key_app() is None
+    access.os_key_for = "UniFi Protect"
+    assert await client.unifi_os_key_app() == "UniFi Protect"
+    # The key goes as X-API-KEY to the console's own port, never the Bearer header.
+    _, url, _, headers = aioclient_mock.mock_calls[-1]
+    assert url.port == 443 and headers["X-API-KEY"] == TOKEN
+    assert "Authorization" not in headers
+
+
+async def test_unifi_os_key_app_swallows_network_errors(hass: HomeAssistant, aioclient_mock) -> None:
+    aioclient_mock.get(re.compile(r"/proxy/"), exc=aiohttp.ClientError("refused"))
+    client = AccessClient(HOST, TOKEN, async_get_clientsession(hass))
+    assert await client.unifi_os_key_app() is None
 
 
 async def test_pin_set_and_remove(client: AccessClient, access: FakeAccess) -> None:
