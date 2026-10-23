@@ -81,9 +81,13 @@ class FakeAccess:
         # An envelope error code for every door group lookup, when set.
         self.door_group_lookup_error: str | None = None
         self.regroup_without_resources = False
-        # Make a new group even when a body names the visitor's own group.
-        self.ignore_group_references = False
+        # GET /door_groups leaves out visitor groups (probe run 3).
+        self.list_hides_visitor_groups = True
         self.refuse_door_group_delete = False
+        # Accept a visitor update but keep the old start and end times.
+        self.ignore_update_times = False
+        # Refuse a visitor update when this returns True for its body.
+        self.refuse_visitor_update: Callable[[dict[str, Any]], bool] | None = None
         # Answer a group DELETE with success but keep the group.
         self.door_group_delete_is_noop = False
         # Extra PIN rule: refuse when this returns True for (visitor id, pin).
@@ -105,7 +109,7 @@ class FakeAccess:
                 return
             data = {"resources": self.sent_resources.get(visitor_id, [])}
         named = [r for r in data["resources"] if r.get("type") == "door_group"]
-        if not self.ignore_group_references and named and len(named) == len(data["resources"]) and all(
+        if named and len(named) == len(data["resources"]) and all(
             r.get("id") in self.door_groups for r in named
         ):
             visitor["resources"] = [
@@ -174,7 +178,10 @@ class FakeAccess:
             self._store_resources(visitor_id, data)
             return self._ok(method, url, self.visitors[visitor_id])
         if path == "door_groups" and method == "GET":
-            return self._ok(method, url, list(self.door_groups.values()))
+            return self._ok(method, url, [
+                g for g in self.door_groups.values()
+                if not (self.list_hides_visitor_groups and str(g.get("name", "")).startswith("visitor-"))
+            ])
         if parts[0] == "door_groups" and len(parts) == 2 and method == "DELETE":
             if self.refuse_door_group_delete:
                 return self._response(method, url, code="CODE_SYSTEM_ERROR", msg="Server system error.")
@@ -193,9 +200,10 @@ class FakeAccess:
             if visitor_id not in self.visitors:
                 return self._response(method, url, status=404)
             if method == "PUT":
-                self.visitors[visitor_id].update(
-                    {k: v for k, v in data.items() if k != "resources"}
-                )
+                if self.refuse_visitor_update and self.refuse_visitor_update(data):
+                    return self._response(method, url, code="CODE_PARAMS_INVALID", msg="bad times")
+                kept = {"resources"} | ({"start_time", "end_time"} if self.ignore_update_times else set())
+                self.visitors[visitor_id].update({k: v for k, v in data.items() if k not in kept})
                 self._store_resources(visitor_id, data)
                 return self._ok(method, url, self.visitors[visitor_id])
             if method == "DELETE":

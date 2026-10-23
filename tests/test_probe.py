@@ -183,9 +183,14 @@ async def investigate(client, *, answer: bool | None = True):
 async def test_door_groups_all_pass_and_delete_only_orphans(
     client: AccessClient, access: FakeAccess
 ) -> None:
+    access.list_hides_visitor_groups = False  # a controller that lists them
     orphan, bobs_group = leftovers(access)
     steps = await investigate(client)
-    assert [s.verdict for s in steps] == ["INFO", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS"]
+    assert [(s.name.split(" ")[0], s.verdict) for s in steps] == [
+        ("GET", "INFO"), ("GET", "PASS"), ("An", "PASS"), ("End", "PASS"),
+        ("Reuse", "PASS"), ("DELETE", "PASS"), ("Deleting", "PASS"),
+        ("Delete", "PASS"), ("Delete", "PASS"),
+    ]
     assert "1 of those used by no visitor" in steps[0].detail
     assert orphan not in access.door_groups
     assert bobs_group in access.door_groups  # a live visitor's group stays
@@ -197,6 +202,7 @@ async def test_door_groups_all_pass_and_delete_only_orphans(
 async def test_door_groups_left_alone_without_a_yes(
     client: AccessClient, access: FakeAccess, answer
 ) -> None:
+    access.list_hides_visitor_groups = False
     orphan, _ = leftovers(access)
     steps = await investigate(client, answer=answer)
     assert steps[-1].verdict == "INFO" and "not deleted" in steps[-1].detail
@@ -208,14 +214,6 @@ async def test_update_without_resources_that_regroups_fails(
 ) -> None:
     access.regroup_without_resources = True
     s = step_named(await investigate(client, answer=None), "An update without resources")
-    assert s.verdict == "FAIL" and "group changed" in s.detail
-
-
-async def test_update_naming_own_group_that_regroups_fails(
-    client: AccessClient, access: FakeAccess
-) -> None:
-    access.ignore_group_references = True
-    s = step_named(await investigate(client, answer=None), "An update sending the visitor's own group")
     assert s.verdict == "FAIL" and "group changed" in s.detail
 
 
@@ -231,6 +229,7 @@ async def test_group_delete_that_keeps_the_group_fails(
 
 async def test_refused_group_delete_fails(client: AccessClient, access: FakeAccess) -> None:
     access.refuse_door_group_delete = True
+    access.list_hides_visitor_groups = False
     steps = await investigate(client)
     assert step_named(steps, "DELETE /door_groups").verdict == "FAIL"
     assert step_named(steps, "Deleting the visitor, then").verdict == "FAIL"
@@ -242,6 +241,68 @@ async def test_door_groups_survive_a_refused_create(client: AccessClient, access
     steps = await investigate(client, answer=None)
     assert step_named(steps, "Create and read back").verdict == "FAIL"
     assert step_named(steps, "Delete every probe visitor").verdict == "PASS"
+
+
+async def test_hidden_visitor_groups_are_reported_not_passed(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    # As on a real controller: the list leaves visitor groups out.
+    orphan, _ = leftovers(access)
+    steps = await investigate(client)
+    assert step_named(steps, "GET /door_groups includes").verdict == "INFO"
+    last = steps[-1]
+    assert last.verdict == "INFO" and "can't be found this way" in last.detail
+    assert orphan in access.door_groups  # invisible, so untouched
+
+
+async def test_refused_early_end_fails_and_skips_reuse(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    # Refuse any update whose window ends before the probe's clock starts.
+    access.refuse_visitor_update = lambda body: body.get("end_time", 0) < 1_800_000_000
+    steps = await investigate(client, answer=None)
+    s = step_named(steps, "End an upcoming visit early")
+    assert s.verdict == "FAIL" and "refused" in s.detail
+    assert step_named(steps, "Reuse the ended visitor").verdict == "SKIP"
+
+
+async def test_early_end_that_regroups_fails(client: AccessClient, access: FakeAccess) -> None:
+    access.regroup_without_resources = True
+    steps = await investigate(client, answer=None)
+    s = step_named(steps, "End an upcoming visit early")
+    assert s.verdict == "FAIL" and "group changed" in s.detail
+
+
+async def test_updates_that_keep_old_times_fail(client: AccessClient, access: FakeAccess) -> None:
+    access.ignore_update_times = True
+    steps = await investigate(client, answer=None)
+    for prefix in ("An update without resources", "End an upcoming visit early"):
+        s = step_named(steps, prefix)
+        assert s.verdict == "FAIL" and "window" in s.detail, (prefix, s.detail)
+
+
+async def test_reuse_that_keeps_the_ended_times_fails(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    # Accept the early end, then ignore the times of the next update only.
+    original = access._store_resources
+    calls = []
+
+    def watch(visitor_id, data):
+        calls.append(data.get("end_time"))
+        access.ignore_update_times = len(calls) >= 3  # create, move, end early
+        return original(visitor_id, data)
+
+    access._store_resources = watch
+    s = step_named(await investigate(client, answer=None), "Reuse the ended visitor")
+    assert s.verdict == "FAIL" and "did not move" in s.detail
+
+
+async def test_listed_groups_and_no_leftovers_pass(client: AccessClient, access: FakeAccess) -> None:
+    access.list_hides_visitor_groups = False
+    access.leak_groups_on_update = access.leak_groups_on_delete = False
+    steps = await investigate(client)
+    assert steps[-1].verdict == "PASS" and steps[-1].detail == "none left"
 
 
 def step_named(steps, prefix: str):

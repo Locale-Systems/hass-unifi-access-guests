@@ -115,12 +115,24 @@ door group made for that visitor (`visitor-<timestamp>`), and that an update
 gives the visitor a new group. The integration never compares the doors it
 reads back, so this doesn't make every pass see a change.
 
-**Open problem: door groups pile up.** Every visitor create and update makes
-a new door group, and neither an update nor deleting the visitor removes the
-old one. The Access app doesn't list them, but the API still finds them. As
-built, the integration would leave one group per guest per occurrence.
-`--door-groups` (below) finds out what the controller allows; the fix
-depends on its answers.
+**Open problem: door groups pile up.** Every visitor create, and every
+update that sends the doors, makes a new door group. Neither an update nor
+deleting the visitor removes the old one. The Access app doesn't show them,
+`GET /door_groups` doesn't list them, but `GET /door_groups/{id}` still
+finds them. As built, the integration would leave one group per guest per
+occurrence. Probe run 3 (`--door-groups`, below) found:
+
+- an update that leaves out `resources` keeps the visitor's group. Routine
+  updates (moving the window, renaming) will stop sending the doors;
+- an update that sends the visitor's own group back leaves it with no
+  single group (most likely no door), so that is never done;
+- `DELETE /door_groups/{id}` was refused with HTTP 401, with a token that may
+  not have had every permission. Being re-checked.
+
+The planned fix: a guest whose events are removed has its visit ended
+early, its PIN removed, and the visitor kept (and reused if the guest is
+booked again), instead of being deleted, so its group stays in use. Only a
+change to the configured doors would still leave a group behind.
 
 Still to check:
 
@@ -151,13 +163,17 @@ for a short visit to end. It ends with a PASS/FAIL summary.
 
 With `--door-groups` it runs a different set of checks on one probe visitor:
 
+- whether `GET /door_groups` lists a visitor's group at all;
 - whether an update without `resources` keeps the visitor's door group;
-- whether an update that sends the visitor's own group back keeps it;
+- whether a visit can be ended early, and the visitor reused for a later
+  visit, both without `resources`, keeping its group;
 - whether `DELETE /door_groups/{id}` removes a group an update replaced, and
   the group of a deleted visitor.
 
 It then lists the leftover `visitor-…` groups that no visitor uses, and in a
-terminal deletes them only if you type `yes`. Groups used by any visitor,
+terminal deletes them only if you type `yes`. If the list doesn't include
+visitor groups, it says leftovers can't be found that way instead of
+passing. Groups used by any visitor,
 including ones you made in the Access app, and groups with other names are
 never deleted.
 

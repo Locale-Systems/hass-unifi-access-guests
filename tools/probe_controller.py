@@ -382,12 +382,18 @@ async def investigate_door_groups(
 
     Probe run 2 showed every visitor create and update makes a door group
     and neither an update nor a delete removes the old one. This finds out
-    what the controller allows: updating without resources, updating with
-    the visitor's own group, and deleting a group. It then offers to delete
-    the leftover visitor groups, but only ones no existing visitor uses, and
-    only on a yes.
+    what the controller allows:
+    - updating without resources;
+    - ending a visit early and reusing the visitor later (how the integration
+      retires a removed guest without orphaning its group);
+    - deleting a group.
+    It then offers to delete the leftover visitor groups, but only ones no
+    existing visitor uses, and only on a yes.
     """
     steps: list[Step] = []
+    # Whether the list shows visitor groups at all. Until a run proves it
+    # does, "no leftovers listed" proves nothing (probe run 3: it doesn't).
+    visitor_groups_listed = False
 
     def step(name: str) -> Step:
         steps.append(Step(name))
@@ -428,6 +434,19 @@ async def investigate_door_groups(
         first = await group_now(v_id)
         say(f"\n    created probe visitor {v_id} with door group {first}")
 
+        s = step("GET /door_groups includes a visitor's own group")
+        try:
+            listed = {str(g["id"]) for g in await list_door_groups(client)}
+            if first and first in listed:
+                visitor_groups_listed = True
+                s.verdict, s.detail = "PASS", f"{first} is listed"
+            else:
+                s.verdict = "INFO"
+                s.detail = f"{first} is not listed, so leftover visitor groups can't be found by listing"
+        except AccessError as err:
+            s.verdict, s.detail = "FAIL", f"could not list door groups: {err}"
+        done(s)
+
         s = step("An update without resources keeps the visitor's group")
         moved = VisitSpec(v.key, v.first_name, v.last_name, v.start + HOUR, v.end + HOUR, v.door_ids, None)
         body = {k: val for k, val in visitor_body(PROBE_ENTRY, moved).items() if k != "resources"}
@@ -445,19 +464,53 @@ async def investigate_door_groups(
             s.verdict, s.detail = "FAIL", f"refused: {err}"
         done(s)
 
-        s = step("An update sending the visitor's own group keeps it")
-        current = await group_now(v_id)
-        body = visitor_body(PROBE_ENTRY, moved)
-        body["resources"] = [{"id": current, "type": "door_group"}]
+        # Probe run 3 (2026-10-23): sending the visitor's own group back left
+        # it with no single group (most likely no door), so that is never
+        # tried again. Removed guests are ended early and kept instead of
+        # deleted, so their groups stay in use; these two steps check that.
+        s = step("End an upcoming visit early (no resources sent)")
+        t = int(now())
+        ended = VisitSpec(v.key, v.first_name, v.last_name, t - 120, t - 60, v.door_ids, None)
+        body = {k: val for k, val in visitor_body(PROBE_ENTRY, ended).items() if k != "resources"}
         try:
+            current = await group_now(v_id)
             await client.update_visitor(v_id, body)
-            after = await group_now(v_id)
-            if after == current:
-                s.verdict, s.detail = "PASS", f"group kept ({current})"
+            got = await find(client, v_id)
+            after = door_groups_of(got) if got else set()
+            if got is None or (got.start_time, got.end_time) != (ended.start, ended.end):
+                s.verdict = "FAIL"
+                s.detail = "accepted, but the window read back as " + (
+                    f"{got.raw.get('start_time')!r}/{got.raw.get('end_time')!r}" if got else "missing"
+                )
+            elif after != {current}:
+                s.verdict, s.detail = "FAIL", f"window ended, but group changed {current} -> {after}"
             else:
-                s.verdict, s.detail = "FAIL", f"group changed {current} -> {after}"
+                s.verdict = "PASS"
+                s.detail = f"window now in the past; status {got.status!r}; group kept"
         except AccessError as err:
             s.verdict, s.detail = "FAIL", f"refused: {err}"
+        done(s)
+        ended_ok = s.verdict == "PASS"
+
+        s = step("Reuse the ended visitor for a later visit (no resources sent)")
+        if not ended_ok:
+            s.detail = "skipped: ending it early did not work"
+        else:
+            t = int(now())
+            again = VisitSpec(v.key, v.first_name, v.last_name, t + 48 * HOUR, t + 49 * HOUR, v.door_ids, None)
+            body = {k: val for k, val in visitor_body(PROBE_ENTRY, again).items() if k != "resources"}
+            try:
+                current = await group_now(v_id)
+                await client.update_visitor(v_id, body)
+                got = await find(client, v_id)
+                if got is None or (got.start_time, got.end_time) != (again.start, again.end):
+                    s.verdict, s.detail = "FAIL", "accepted, but the window did not move"
+                elif door_groups_of(got) != {current}:
+                    s.verdict, s.detail = "FAIL", f"group changed {current} -> {door_groups_of(got)}"
+                else:
+                    s.verdict, s.detail = "PASS", f"status {got.status!r}; group kept"
+            except AccessError as err:
+                s.verdict, s.detail = "FAIL", f"refused: {err}"
         done(s)
 
         s = step("DELETE /door_groups/{id} removes the group an update replaced")
@@ -509,7 +562,10 @@ async def investigate_door_groups(
         s.verdict, s.detail = "FAIL", f"could not list them: {err}"
         done(s)
         return steps
-    if not orphans:
+    if not orphans and not visitor_groups_listed:
+        s.verdict = "INFO"
+        s.detail = "GET /door_groups doesn't list visitor groups, so leftovers can't be found this way"
+    elif not orphans:
         s.verdict, s.detail = "PASS", "none left"
     else:
         for g in orphans:
