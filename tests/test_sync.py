@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from custom_components.unifi_access_guests.api import Visitor
 from custom_components.unifi_access_guests.sync import (
+    CANCELLED,
     CalendarItem,
     VisitSpec,
     build_specs,
@@ -14,6 +15,7 @@ from custom_components.unifi_access_guests.sync import (
     parse_pin,
     plan,
     split_name,
+    visitor_body,
 )
 
 ENTRY = "01JTESTENTRY0000000000000A"
@@ -43,7 +45,7 @@ def spec(**kwargs) -> VisitSpec:
 
 
 def visitor_for(s: VisitSpec, *, vid="v1", entry=ENTRY, start=None, end=None,
-                first=None, remarks=None) -> Visitor:
+                first=None, remarks=None, status="UPCOMING") -> Visitor:
     return Visitor.from_api({
         "id": vid,
         "first_name": first or s.first_name,
@@ -51,7 +53,7 @@ def visitor_for(s: VisitSpec, *, vid="v1", entry=ENTRY, start=None, end=None,
         "remarks": remarks if remarks is not None else make_remarks(entry, s),
         "start_time": s.start if start is None else start,
         "end_time": s.end if end is None else end,
-        "status": "UPCOMING",
+        "status": status,
     })
 
 
@@ -206,7 +208,9 @@ def test_marker_round_trip_and_hides_pin() -> None:
     remarks = make_remarks(ENTRY, s)
     assert "4821" not in remarks
     marker = parse_marker(remarks)
-    assert (marker.entry_id, marker.key, marker.spec) == (ENTRY, s.key, s.spec_digest())
+    assert (marker.entry_id, marker.key, marker.spec, marker.doors) == (
+        ENTRY, s.key, s.spec_digest(), s.doors_digest()
+    )
     assert parse_marker("Visiting for the interview") is None
     assert parse_marker("") is None
 
@@ -218,7 +222,7 @@ def test_new_guest_is_created() -> None:
     s = spec()
     result = run([s], [])
     assert result.creates == [s]
-    assert not result.updates and not result.deletes
+    assert not result.updates and not result.retires
 
 
 def test_matching_visitor_is_unchanged() -> None:
@@ -228,12 +232,13 @@ def test_matching_visitor_is_unchanged() -> None:
     assert len(result.unchanged) == 1
 
 
-def test_moved_event_updates_its_visitor() -> None:
+def test_moved_event_updates_without_doors() -> None:
     old = spec()
     new = spec(start=NOW + 3 * HOUR)
-    result = run([new], [visitor_for(old)])
-    assert result.updates == [(visitor_for(old), new)]
-    assert not result.creates and not result.deletes
+    [update] = run([new], [visitor_for(old)]).updates
+    assert update.spec == new
+    # Same doors: the update leaves resources out, keeping the door group.
+    assert (update.send_doors, update.revive) == (False, False)
 
 
 def test_ended_visitor_rolls_to_the_next_occurrence() -> None:
@@ -242,40 +247,67 @@ def test_ended_visitor_rolls_to_the_next_occurrence() -> None:
     later = NOW + 3 * HOUR
     [rolled], _ = specs(*occurrences, now=later)
     result = run([rolled], [visitor_for(first)], now=later)
-    assert [s for _, s in result.updates] == [rolled]
+    [update] = result.updates
+    assert update.spec == rolled and not update.send_doors
     assert not result.creates and not result.ended
 
 
-def test_door_change_updates_via_spec_digest() -> None:
+def test_door_change_sends_doors() -> None:
     s = spec()
     [narrowed], _ = specs(item(), doors=["door-a"])
-    result = run([narrowed], [visitor_for(s)])
-    assert [n for _, n in result.updates] == [narrowed]
+    [update] = run([narrowed], [visitor_for(s)]).updates
+    assert update.spec == narrowed and update.send_doors
 
 
 def test_edit_on_the_controller_is_reverted() -> None:
     s = spec()
-    assert [n for _, n in run([s], [visitor_for(s, end=s.end + HOUR)]).updates] == [s]
-    assert [n for _, n in run([s], [visitor_for(s, first="Janet")]).updates] == [s]
+    for edited in (visitor_for(s, end=s.end + HOUR), visitor_for(s, first="Janet")):
+        [update] = run([s], [edited]).updates
+        assert update.spec == s and not update.send_doors
 
 
-def test_changed_pin_replaces_the_visitor() -> None:
+def test_changed_pin_retires_the_old_visitor_and_creates_one() -> None:
     old = spec(description="PIN: 1111")
     new = spec(description="PIN: 2222")
     v = visitor_for(old)
     result = run([new], [v])
-    assert result.deletes == [v]
+    assert result.retires == [v]
     assert result.creates == [new]
 
 
-def test_removed_upcoming_guest_is_deleted() -> None:
+def test_removed_upcoming_guest_is_retired() -> None:
     v = visitor_for(spec())
-    assert run([], [v]).deletes == [v]
+    assert run([], [v]).retires == [v]
 
 
-def test_removed_guest_in_progress_is_deleted() -> None:
+def test_removed_guest_in_progress_is_retired() -> None:
     v = visitor_for(spec(start=NOW - HOUR, end=NOW + HOUR))
-    assert run([], [v]).deletes == [v]
+    assert run([], [v]).retires == [v]
+
+
+def test_cancelled_visitor_is_not_retired_again() -> None:
+    v = visitor_for(spec(), status=CANCELLED)
+    result = run([], [v])
+    assert result.is_empty and result.ended == [v]
+
+
+def test_returning_guest_revives_its_cancelled_visitor() -> None:
+    s = spec()
+    v = visitor_for(s, status=CANCELLED)
+    result = run([s], [v])
+    [update] = result.updates
+    assert update.revive and not update.send_doors
+    assert not result.creates
+
+
+def test_live_visitor_wins_over_a_cancelled_duplicate() -> None:
+    s = spec()
+    cancelled = visitor_for(s, vid="v1", status=CANCELLED)
+    live = visitor_for(s, vid="v2")
+    result = run([s], [cancelled, live])
+    assert [v.id for v, _ in result.unchanged] == ["v2"]
+    assert result.ended == [cancelled]
+    assert not result.updates and not result.retires
 
 
 def test_ended_visit_with_nothing_left_is_kept_as_history() -> None:
@@ -299,10 +331,18 @@ def test_visitors_of_other_entries_or_people_are_ignored() -> None:
     assert run([s], [other_entry, hand_made]).creates == [s]
 
 
-def test_duplicate_visitor_for_one_guest_is_deleted() -> None:
+def test_duplicate_visitor_for_one_guest_is_retired() -> None:
     s = spec()
     first, second = visitor_for(s, vid="v1"), visitor_for(s, vid="v2")
     result = run([s], [first, second])
-    assert result.deletes == [second]
+    assert result.retires == [second]
     assert len(result.unchanged) == 1
     assert not result.creates
+
+
+def test_visitor_body_leaves_doors_out_on_request() -> None:
+    s = spec()
+    assert visitor_body(ENTRY, s)["resources"] == [
+        {"id": "door-a", "type": "door"}, {"id": "door-b", "type": "door"}
+    ]
+    assert "resources" not in visitor_body(ENTRY, s, doors=False)

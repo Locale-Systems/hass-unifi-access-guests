@@ -11,8 +11,8 @@ from homeassistant.util import dt as dt_util
 
 from .api import AccessClient, AccessError
 from .const import CONF_API_TOKEN, CONF_HOST, CONF_VERIFY_SSL
-from .coordinator import GuestsConfigEntry, GuestsCoordinator
-from .sync import parse_marker
+from .coordinator import GuestsConfigEntry, GuestsCoordinator, retire
+from .sync import CANCELLED, parse_marker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,11 +42,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: GuestsConfigEntry) -> b
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: GuestsConfigEntry) -> None:
-    """Delete this entry's open and upcoming visitors from the controller.
+    """Retire this entry's open and upcoming visitors on the controller.
 
-    A re-added entry gets a new id, so anything left behind would never be
-    cleaned up and would duplicate the visits the new entry creates. Ended
-    visits stay, as history. Best effort: the controller may be unreachable.
+    A re-added entry gets a new id and never touches these again, so they
+    must not stay live: each one's PIN is removed and its visit cancelled.
+    They are kept rather than deleted, because deleting a visitor leaves
+    its door group behind (LOC-304). Ended and already-cancelled visits
+    stay as they are. Best effort: the controller may be unreachable.
     """
     client = build_client(hass, entry.data)
     now = int(dt_util.now().timestamp())
@@ -54,7 +56,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: GuestsConfigEntry) -> N
         visitors = await client.list_visitors()
     except AccessError as err:
         _LOGGER.warning(
-            "Could not remove visitors created by %s: %s", entry.title, err
+            "Could not cancel the visits created by %s: %s", entry.title, err
         )
         return
     for visitor in visitors:
@@ -63,11 +65,13 @@ async def async_remove_entry(hass: HomeAssistant, entry: GuestsConfigEntry) -> N
             continue
         if visitor.end_time is not None and visitor.end_time <= now:
             continue
+        if visitor.status == CANCELLED:
+            continue
         try:
-            await client.delete_visitor(visitor.id)
+            await retire(client, visitor)
         except AccessError as err:
             _LOGGER.warning(
-                "Could not remove visitor %s %s: %s",
+                "Could not cancel the visit of %s %s: %s",
                 visitor.first_name,
                 visitor.last_name,
                 err,

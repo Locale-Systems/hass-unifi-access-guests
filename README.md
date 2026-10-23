@@ -45,15 +45,26 @@ Every 5 minutes by default, or when you press **Sync now**:
 - creates a visitor for each new guest within the sync horizon (30 days by default);
 - updates the visitor when its window moves on, an event moves or is renamed,
   or someone edits the visitor in UniFi Access (the calendar wins);
-- replaces the visitor when its PIN changes;
-- deletes the visitor when the guest's events are removed, if the visit hasn't ended;
-- leaves ended visits with nothing left on the calendar on the controller, as history.
+- treats a changed PIN as a new guest: the old visitor is cancelled, a new one created;
+- **cancels** the visit when the guest's events are removed, if it hasn't
+  ended: the visitor shows as Cancelled in Access, and its PIN is removed;
+- **revives** that same visitor, PIN and all, if the guest is booked again;
+- leaves ended and cancelled visits with nothing left on the calendar as
+  they are, as history.
+
+It never deletes a visitor. The controller makes a hidden door group for
+each visitor from the doors it's sent, and deleting the visitor leaves that
+group behind. So visitors are kept, and routine updates don't resend the
+doors (resending them makes a new group). Only changing the configured
+doors does; the visitor's old group is then deleted, which needs a token
+with every permission. Without it, a notification says so.
 
 ### When a visit can't sync
 
 If the controller refuses a visit (for example, its PIN already belongs to
 someone else), Home Assistant shows a notification naming the guest and the
-controller's reason, without the PIN. It's raised once, not every pass, and
+controller's reason, without the PIN. A new guest whose PIN is refused is
+cancelled, and revived with its PIN on the next pass that can. It's raised once, not every pass, and
 clears by itself once the visit syncs. The error is also listed on the
 **Visits** sensor. Your calendar events are never edited.
 
@@ -62,7 +73,8 @@ visitor's remarks, so it never changes visitors you added by hand. If the
 calendar can't be read, the pass changes nothing; an unreadable calendar is
 never treated as an empty one.
 
-Removing the integration deletes its open and upcoming visitors.
+Removing the integration cancels its open and upcoming visits (and removes
+their PINs); it deletes nothing.
 
 PINs are never shown in entity attributes or diagnostics. They do sit in the
 calendar event as plain text, so share the calendar accordingly.
@@ -115,31 +127,23 @@ door group made for that visitor (`visitor-<timestamp>`), and that an update
 gives the visitor a new group. The integration never compares the doors it
 reads back, so this doesn't make every pass see a change.
 
-**Open problem: door groups pile up.** Every visitor create, and every
-update that sends the doors, makes a new door group. Neither an update nor
-deleting the visitor removes the old one. The Access app doesn't show them,
-`GET /door_groups` doesn't list them, but `GET /door_groups/{id}` still
-finds them. As built, the integration would leave one group per guest per
-occurrence. Probe run 3 (`--door-groups`, below) found:
+**Door groups (solved by design).** Every visitor create, and every update
+that sends the doors, makes a new door group, and neither an update nor
+deleting the visitor removes the old one. The Access app doesn't show them
+and `GET /door_groups` doesn't list them. Probe runs 3 to 5 (`--door-groups`,
+below) found:
 
-- an update that leaves out `resources` keeps the visitor's group. Routine
-  updates (moving the window, renaming) will stop sending the doors;
+- an update that leaves out `resources` keeps the visitor's group;
 - an update that sends the visitor's own group back leaves it with no
   single group (most likely no door), so that is never done;
-- `DELETE /door_groups/{id}` was refused with HTTP 401 by a token without
-  every permission. With every permission (run 4) the delete went through,
-  and looking the group up afterwards made the controller fail with "nil
-  pointer dereference" instead of answering not-found. The probe now
-  compares that against a lookup of a made-up id to tell whether it means
-  "gone";
-- ending a visit early with both times in the past was refused
-  (`CODE_PARAMS_INVALID`). The probe now tries an end time just ahead, and
-  cancelling (`is_force=false`) as an alternative.
-
-The planned fix: a guest whose events are removed has its visit ended
-early, its PIN removed, and the visitor kept (and reused if the guest is
-booked again), instead of being deleted, so its group stays in use. Only a
-change to the configured doors would still leave a group behind.
+- cancelling (`DELETE ?is_force=false`) keeps the visitor and its group, and
+  a later update revives it;
+- `DELETE /door_groups/{id}` works with a token that has every permission
+  (HTTP 401 without). Looking up a deleted group then fails with "nil
+  pointer dereference", the same as a made-up id; the probe treats that
+  as gone only after checking that a live group is found;
+- ending a visit early needs its end still ahead (both times in the past is
+  refused), so cancelling is used instead.
 
 Still to check:
 

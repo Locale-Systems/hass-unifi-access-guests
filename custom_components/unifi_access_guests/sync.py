@@ -18,9 +18,19 @@ ends, the next pass moves the same visitor on to the following occurrence.
 The controller never holds more than one window, so it never grants time the
 calendar doesn't show.
 
+Visitors are never deleted. The controller turns the doors sent with a
+visitor into a door group made for it, and deleting the visitor leaves the
+group behind (LOC-304, probe runs 2-5). So:
+
+- updates leave ``resources`` out unless the configured doors changed (an
+  update without them keeps the visitor's group);
+- a guest whose events are removed is *retired*: its visit is cancelled
+  (status CANCELLED) and its PIN removed. If the guest is booked again,
+  the same visitor is revived and its PIN set again.
+
 Each managed visitor carries a marker in its ``remarks`` field::
 
-    ha-guests:v1:<entry id>:<guest key>:<spec digest>
+    ha-guests:v2:<entry id>:<guest key>:<spec digest>:<doors digest>
 
 The marker is the only link between a visitor and its guest, and it lives on
 the controller, so a reinstalled Home Assistant (or lost storage) still finds
@@ -41,11 +51,14 @@ import re
 from .api import Visitor
 from .const import FALLBACK_LAST_NAME, VISIT_REASON
 
-MARKER_PREFIX = "ha-guests:v1"
+# v2 added the doors digest (2026-10-23); no v1 visitor was ever deployed.
+MARKER_PREFIX = "ha-guests:v2"
 _MARKER_RE = re.compile(
     rf"{re.escape(MARKER_PREFIX)}:(?P<entry>[0-9A-Za-z]+)"
-    r":(?P<key>[0-9a-f]{16}):(?P<spec>[0-9a-f]{8})"
+    r":(?P<key>[0-9a-f]{16}):(?P<spec>[0-9a-f]{8}):(?P<doors>[0-9a-f]{8})"
 )
+# A cancelled visit (DELETE ?is_force=false): how a guest is retired.
+CANCELLED = "CANCELLED"
 REMARKS_TEXT = "Managed by Home Assistant from a calendar event; edits here are overwritten."
 
 # "PIN: 4821", "pin=4821", "PIN 4821". Four to twelve digits; the controller
@@ -109,6 +122,10 @@ class VisitSpec:
         ]
         return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:8]
 
+    def doors_digest(self) -> str:
+        """Hash of the doors alone: a change means sending ``resources``."""
+        return hashlib.sha256(",".join(self.door_ids).encode()).hexdigest()[:8]
+
 
 @dataclass(frozen=True, slots=True)
 class Marker:
@@ -117,6 +134,19 @@ class Marker:
     entry_id: str
     key: str
     spec: str
+    doors: str
+
+
+@dataclass(frozen=True, slots=True)
+class Update:
+    """Bring an existing visitor in line with its guest."""
+
+    visitor: Visitor
+    spec: VisitSpec
+    # The configured doors changed: send them, which makes a new door group.
+    send_doors: bool
+    # The visitor was retired (cancelled, PIN removed) and is being revived.
+    revive: bool
 
 
 @dataclass(slots=True)
@@ -124,19 +154,18 @@ class Plan:
     """Changes needed to make the controller match the calendar."""
 
     creates: list[VisitSpec] = field(default_factory=list)
-    updates: list[tuple[Visitor, VisitSpec]] = field(default_factory=list)
-    deletes: list[Visitor] = field(default_factory=list)
+    updates: list[Update] = field(default_factory=list)
+    retires: list[Visitor] = field(default_factory=list)
     unchanged: list[tuple[Visitor, VisitSpec]] = field(default_factory=list)
     # Visitors this entry owns that the plan leaves alone because their guest
-    # has nothing left on the calendar and the visit is over. The controller
-    # already refuses them; deleting would erase the visit from Access's
-    # history.
+    # has nothing left on the calendar and the visit is over or already
+    # cancelled. The controller already refuses them.
     ended: list[Visitor] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
         """True when nothing needs to change."""
-        return not (self.creates or self.updates or self.deletes)
+        return not (self.creates or self.updates or self.retires)
 
 
 def _plain_text(description: str) -> str:
@@ -251,7 +280,9 @@ def build_specs(
 
 def make_remarks(entry_id: str, spec: VisitSpec) -> str:
     """Remarks text carrying the marker for ``spec``."""
-    marker = f"{MARKER_PREFIX}:{entry_id}:{spec.key}:{spec.spec_digest()}"
+    marker = (
+        f"{MARKER_PREFIX}:{entry_id}:{spec.key}:{spec.spec_digest()}:{spec.doors_digest()}"
+    )
     return f"{REMARKS_TEXT} [{marker}]"
 
 
@@ -260,20 +291,28 @@ def parse_marker(remarks: str) -> Marker | None:
     match = _MARKER_RE.search(remarks or "")
     if not match:
         return None
-    return Marker(entry_id=match["entry"], key=match["key"], spec=match["spec"])
+    return Marker(
+        entry_id=match["entry"], key=match["key"], spec=match["spec"], doors=match["doors"]
+    )
 
 
-def visitor_body(entry_id: str, spec: VisitSpec) -> dict[str, object]:
-    """Request body for creating or updating a visitor."""
-    return {
+def visitor_body(entry_id: str, spec: VisitSpec, *, doors: bool = True) -> dict[str, object]:
+    """Request body for creating or updating a visitor.
+
+    ``doors=False`` leaves ``resources`` out, which keeps the visitor's door
+    group; sending them makes a new one.
+    """
+    body: dict[str, object] = {
         "first_name": spec.first_name,
         "last_name": spec.last_name,
         "remarks": make_remarks(entry_id, spec),
         "start_time": spec.start,
         "end_time": spec.end,
         "visit_reason": VISIT_REASON,
-        "resources": [{"id": door_id, "type": "door"} for door_id in spec.door_ids],
     }
+    if doors:
+        body["resources"] = [{"id": door_id, "type": "door"} for door_id in spec.door_ids]
+    return body
 
 
 def _drifted(visitor: Visitor, spec: VisitSpec) -> bool:
@@ -294,38 +333,49 @@ def plan(
     now: int,
     horizon_end: int,
 ) -> Plan:
-    """Work out the creates, updates and deletes.
+    """Work out the creates, updates and retires.
 
     ``desired`` holds every guest the calendar shows between ``now`` and
     ``horizon_end``. A guest's existing visitor is reused even after its
-    window has ended: that is how the rolling window moves on. A visitor whose
-    guest is gone is deleted only while its window is still open or upcoming
-    within the horizon: an ended visit stays as history, and one starting past
-    the horizon (left over from a longer horizon setting) is outside what
-    ``desired`` can speak for.
+    window has ended or it was retired: that is how the rolling window moves
+    on, and how a returning guest gets their visitor back. A visitor whose
+    guest is gone is retired only while its window is still open or upcoming
+    within the horizon. An ended or already-cancelled visit stays as history.
+    One starting past the horizon (left over from a longer horizon setting) is
+    outside what ``desired`` can speak for.
     """
     result = Plan()
     wanted = {spec.key: spec for spec in desired if spec.end > now}
     seen: set[str] = set()
 
-    for visitor in visitors:
+    # Live visitors first, so a guest with a cancelled duplicate keeps its
+    # live one rather than reviving the duplicate.
+    for visitor in sorted(visitors, key=lambda v: v.status == CANCELLED):
         marker = parse_marker(visitor.remarks)
         if marker is None or marker.entry_id != entry_id:
             continue
+        cancelled = visitor.status == CANCELLED
         spec = wanted.get(marker.key)
         if spec is None or marker.key in seen:
             # Gone from the calendar, or a duplicate left by a create whose
             # response was lost.
             ended = visitor.end_time is not None and visitor.end_time <= now
             beyond = visitor.start_time is not None and visitor.start_time >= horizon_end
-            if ended:
+            if ended or cancelled:
                 result.ended.append(visitor)
             elif not beyond or marker.key in seen:
-                result.deletes.append(visitor)
+                result.retires.append(visitor)
             continue
         seen.add(marker.key)
-        if marker.spec != spec.spec_digest() or _drifted(visitor, spec):
-            result.updates.append((visitor, spec))
+        if cancelled or marker.spec != spec.spec_digest() or _drifted(visitor, spec):
+            result.updates.append(
+                Update(
+                    visitor=visitor,
+                    spec=spec,
+                    send_doors=marker.doors != spec.doors_digest(),
+                    revive=cancelled,
+                )
+            )
         else:
             result.unchanged.append((visitor, spec))
 

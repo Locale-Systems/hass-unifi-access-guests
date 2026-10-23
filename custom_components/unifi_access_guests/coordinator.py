@@ -68,7 +68,7 @@ class SyncResult:
     visits: list[VisitSummary] = field(default_factory=list)
     created: int = 0
     updated: int = 0
-    deleted: int = 0
+    retired: int = 0
     skipped_events: int = 0
     errors: list[VisitError] = field(default_factory=list)
 
@@ -218,30 +218,42 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
     async def _apply(self, work: Plan, result: SyncResult) -> None:
         """Carry out a plan. One failed visitor never stops the others.
 
-        The order doesn't matter for PINs: guests are keyed by PIN, so a PIN
-        moving between events stays with one visitor and is never deleted
-        and recreated in one pass.
+        Only operations proven on a real controller are used (LOC-304 probe
+        run 5): an update without resources keeps a visitor's door group; a
+        cancelled visitor is revived by an update; PINs are set and removed
+        on live visitors. Setting or removing a PIN on a cancelled visitor was
+        never tested, so it is never done.
         """
         entry_id = self.config_entry.entry_id
 
-        for visitor in work.deletes:
+        for visitor in work.retires:
             try:
-                await self.client.delete_visitor(visitor.id)
-                result.deleted += 1
+                await retire(self.client, visitor)
+                result.retired += 1
             except AccessAuthError:
                 raise
             except AccessError as err:
-                result.errors.append(_visitor_error(visitor, err))
+                result.errors.append(_visitor_error(visitor, "cancel the visit", err))
 
-        for visitor, spec in work.updates:
+        for update in work.updates:
+            spec = update.spec
             try:
-                await self.client.update_visitor(visitor.id, visitor_body(entry_id, spec))
-                result.updated += 1
-                result.visits.append(_summary(spec))
+                await self.client.update_visitor(
+                    update.visitor.id, visitor_body(entry_id, spec, doors=update.send_doors)
+                )
             except AccessAuthError:
                 raise
             except AccessError as err:
                 result.errors.append(_spec_error(spec, "update the visit", err))
+                continue
+            if update.revive and spec.pin and not await self._set_pin_or_cancel(
+                update.visitor.id, spec, result
+            ):
+                continue
+            result.updated += 1
+            result.visits.append(_summary(spec))
+            if update.send_doors:
+                await self._drop_door_groups(update.visitor.door_group_ids, spec, result)
 
         for spec in work.creates:
             try:
@@ -251,25 +263,54 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
             except AccessError as err:
                 result.errors.append(_spec_error(spec, "create the visit", err))
                 continue
-            if spec.pin:
-                try:
-                    await self.client.set_visitor_pin(visitor_id, spec.pin)
-                except AccessError as err:
-                    # The guest key stands for the PIN, so a visitor left
-                    # without it would look correct to every later pass.
-                    # Remove it and let the next pass create it again.
-                    result.errors.append(_pin_error(spec, err))
-                    try:
-                        await self.client.delete_visitor(visitor_id)
-                    except AccessError as cleanup_err:
-                        result.errors.append(
-                            _spec_error(spec, "remove the visit after the PIN failed", cleanup_err)
-                        )
-                    if isinstance(err, AccessAuthError):
-                        raise
-                    continue
+            if spec.pin and not await self._set_pin_or_cancel(visitor_id, spec, result):
+                continue
             result.created += 1
             result.visits.append(_summary(spec))
+
+    async def _set_pin_or_cancel(self, visitor_id: str, spec: VisitSpec, result: SyncResult) -> bool:
+        """Set a live visitor's PIN; if refused, cancel the visit.
+
+        A visitor left live without its PIN would look correct to every later
+        pass, since the guest key stands for the PIN. Cancelled, it is revived
+        and its PIN tried again next pass. Deleting it instead would leave its
+        door group behind.
+        """
+        try:
+            await self.client.set_visitor_pin(visitor_id, spec.pin)
+        except AccessError as err:
+            result.errors.append(_pin_error(spec, err))
+            try:
+                await self.client.cancel_visitor(visitor_id)
+            except AccessError as cleanup_err:
+                result.errors.append(
+                    _spec_error(spec, "cancel the visit after the PIN failed", cleanup_err)
+                )
+            if isinstance(err, AccessAuthError):
+                raise
+            return False
+        return True
+
+    async def _drop_door_groups(
+        self, group_ids: set[str], spec: VisitSpec, result: SyncResult
+    ) -> None:
+        """Delete the door groups an update with new doors replaced.
+
+        Best effort, and never a reason to re-authenticate: a token without
+        every permission gets HTTP 401 here while everything else works.
+        """
+        for group_id in sorted(group_ids):
+            try:
+                await self.client.delete_door_group(group_id)
+            except AccessAuthError:
+                result.errors.append(
+                    VisitError(
+                        spec.key, spec.name, _ts(spec.start), "remove its old door group",
+                        "the API token lacks a permission; give it every permission it offers",
+                    )
+                )
+            except AccessError as err:
+                result.errors.append(_spec_error(spec, "remove its old door group", err))
 
     @callback
     def _notify(self, errors: list[VisitError]) -> None:
@@ -312,13 +353,31 @@ class GuestsCoordinator(DataUpdateCoordinator[SyncResult]):
         return f"{DOMAIN}_{self.config_entry.entry_id}_{key}"
 
 
-def _visitor_error(visitor: Visitor, err: AccessError) -> VisitError:
+async def retire(client: AccessClient, visitor: Visitor) -> None:
+    """Retire a guest's visitor: remove its PIN, then cancel the visit.
+
+    The PIN goes first, while the visitor is live (PIN removal on a
+    cancelled visitor is untested). A failed PIN removal doesn't stop the
+    cancel: the visitor may have had no PIN, and cancelling is what
+    revokes access. The visitor and its door group are kept, so the guest
+    can be revived.
+    """
+    try:
+        await client.set_visitor_pin(visitor.id, None)
+    except AccessAuthError:
+        raise
+    except AccessError as err:
+        _LOGGER.debug("PIN removal for visitor %s: %s", visitor.id, err)
+    await client.cancel_visitor(visitor.id)
+
+
+def _visitor_error(visitor: Visitor, action: str, err: AccessError) -> VisitError:
     marker = parse_marker(visitor.remarks)
     start = _ts(visitor.start_time) if visitor.start_time is not None else None
     return VisitError(
         marker.key if marker else visitor.id,
         f"{visitor.first_name} {visitor.last_name}",
         start,
-        "remove the visit",
+        action,
         err.reason,
     )

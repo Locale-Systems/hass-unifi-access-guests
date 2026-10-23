@@ -25,6 +25,7 @@ DOORS_PATH = "/api/v1/developer/doors"
 VISITORS_PATH = "/api/v1/developer/visitors"
 VISITOR_PATH = "/api/v1/developer/visitors/{visitor_id}"
 VISITOR_PIN_PATH = "/api/v1/developer/visitors/{visitor_id}/pin_codes"
+DOOR_GROUP_PATH = "/api/v1/developer/door_groups/{group_id}"
 
 # Endpoints that accept a UniFi OS API key (X-API-KEY) on the console's own
 # port, used only to explain a token the Access API rejected.
@@ -81,6 +82,15 @@ class Visitor:
     end_time: int | None
     status: str
     raw: dict[str, Any] = field(repr=False, compare=False)
+
+    @property
+    def door_group_ids(self) -> set[str]:
+        """The door groups the controller made from the doors it was sent."""
+        return {
+            str(r["id"])
+            for r in self.raw.get("resources") or []
+            if isinstance(r, dict) and r.get("type") == "door_group" and r.get("id")
+        }
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> Visitor:
@@ -197,12 +207,30 @@ class AccessClient:
         )
 
     async def delete_visitor(self, visitor_id: str) -> None:
-        """Delete a visitor outright (is_force=true), not just cancel it."""
+        """Delete a visitor outright (is_force=true), not just cancel it.
+
+        The integration never does this (it leaves the visitor's door group
+        behind); the probe uses it to clean up after itself.
+        """
         await self._request(
             "DELETE",
             VISITOR_PATH.format(visitor_id=visitor_id),
             params={"is_force": "true"},
         )
+
+    async def cancel_visitor(self, visitor_id: str) -> None:
+        """Cancel a visit (is_force=false): status CANCELLED, record and door
+        group kept, and a later update revives it (LOC-304 probe run 5)."""
+        await self._request(
+            "DELETE",
+            VISITOR_PATH.format(visitor_id=visitor_id),
+            params={"is_force": "false"},
+        )
+
+    async def delete_door_group(self, group_id: str) -> None:
+        """Delete a door group. Needs a token with every permission: a lesser
+        one gets HTTP 401 (probe runs 3 and 5)."""
+        await self._request("DELETE", DOOR_GROUP_PATH.format(group_id=group_id))
 
     async def set_visitor_pin(self, visitor_id: str, pin: str | None) -> None:
         """Assign a visitor's PIN, or remove it when ``pin`` is empty."""

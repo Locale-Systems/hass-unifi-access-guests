@@ -39,7 +39,7 @@ async def async_get_config_entry_diagnostics(
             "finished": result.finished.isoformat() if result else None,
             "created": result.created if result else None,
             "updated": result.updated if result else None,
-            "deleted": result.deleted if result else None,
+            "retired": result.retired if result else None,
             "skipped_events": result.skipped_events if result else None,
             "errors": [e.describe() for e in result.errors] if result else None,
         },
@@ -47,8 +47,16 @@ async def async_get_config_entry_diagnostics(
         if work is None
         else {
             "creates": [s.key for s in work.creates],
-            "updates": [{"visitor": visitor(v), "key": s.key} for v, s in work.updates],
-            "deletes": [visitor(v) for v in work.deletes],
+            "updates": [
+                {
+                    "visitor": visitor(u.visitor),
+                    "key": u.spec.key,
+                    "send_doors": u.send_doors,
+                    "revive": u.revive,
+                }
+                for u in work.updates
+            ],
+            "retires": [visitor(v) for v in work.retires],
             "unchanged": [visitor(v) for v, _ in work.unchanged],
             "ended": [visitor(v) for v in work.ended],
         },

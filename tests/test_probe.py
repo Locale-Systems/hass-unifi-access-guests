@@ -81,11 +81,11 @@ async def test_cleans_up_only_probe_visitors(client: AccessClient, access: FakeA
     hand_made = access.add_visitor(first_name="Plumber", last_name="Bob", remarks="Let in at 9")
     other_entry = access.add_visitor(
         first_name="Jane", last_name="Doe",
-        remarks="[ha-guests:v1:01JREALENTRY000000000000AA:0123456789abcdef:01234567]",
+        remarks="[ha-guests:v2:01JREALENTRY000000000000AA:0123456789abcdef:01234567:89abcdef]",
     )
     leftover = access.add_visitor(
         first_name="Probe", last_name="Visitor 1",
-        remarks="[ha-guests:v1:probe:0123456789abcdef:01234567]",
+        remarks="[ha-guests:v2:probe:0123456789abcdef:01234567:89abcdef]",
     )
     steps = await run(client)
     assert step_named(steps, "Delete every probe visitor").verdict == "PASS"

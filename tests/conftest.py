@@ -212,6 +212,9 @@ class FakeAccess:
                     return self._response(method, url, code="CODE_PARAMS_INVALID", msg="bad times")
                 kept = {"resources"} | ({"start_time", "end_time"} if self.ignore_update_times else set())
                 self.visitors[visitor_id].update({k: v for k, v in data.items() if k not in kept})
+                if self.visitors[visitor_id].get("status") == "CANCELLED":
+                    # An update revives a cancelled visit (probe run 5).
+                    self.visitors[visitor_id]["status"] = "UPCOMING"
                 self._store_resources(visitor_id, data)
                 return self._ok(method, url, self.visitors[visitor_id])
             if method == "DELETE":
