@@ -273,10 +273,17 @@ class AccessClient:
                     raise AccessError(f"{method} {path}: invalid JSON") from err
         except AccessError:
             raise
+        # The full URL and the error's type: "could not reach" is otherwise
+        # all anyone sees, and the cause (wrong host or port, a firewall, a
+        # name HA can't resolve, an SSL failure) is in these details.
         except TimeoutError as err:
-            raise AccessConnectionError(f"{method} {path}: timed out") from err
+            raise AccessConnectionError(
+                f"{method} {url}: no answer within {self._timeout.total:.0f} s"
+            ) from err
         except (aiohttp.ClientError, OSError) as err:
-            raise AccessConnectionError(f"{method} {path}: {err}") from err
+            raise AccessConnectionError(
+                f"{method} {url}: {type(err).__name__}: {err}"
+            ) from err
 
         if not isinstance(payload, dict):
             raise AccessError(f"{method} {path}: unexpected response {payload!r}"[:300])

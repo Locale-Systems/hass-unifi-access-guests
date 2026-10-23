@@ -94,13 +94,31 @@ async def test_reauth_with_a_unifi_os_key(
     assert result["errors"] == {"base": "unifi_os_key"}
 
 
-async def test_unreachable_controller(hass: HomeAssistant, aioclient_mock) -> None:
+async def test_unreachable_controller(hass: HomeAssistant, aioclient_mock, caplog) -> None:
     aioclient_mock.get(
         "https://192.0.2.10:12445/api/v1/developer/doors", exc=TimeoutError()
     )
     result = await start(hass)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECTION)
     assert result["errors"] == {"base": "cannot_connect"}
+    # The log names what was tried, so a wrong host, port or firewall shows.
+    assert "https://192.0.2.10:12445/api/v1/developer/doors: no answer within 15 s" in caplog.text
+
+
+async def test_connection_refused_is_logged_with_its_cause(
+    hass: HomeAssistant, aioclient_mock, caplog
+) -> None:
+    import aiohttp
+
+    aioclient_mock.get(
+        "https://192.0.2.10:12445/api/v1/developer/doors",
+        exc=aiohttp.ClientConnectionError("Connect call failed ('192.0.2.10', 12445)"),
+    )
+    result = await start(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], CONNECTION)
+    assert result["errors"] == {"base": "cannot_connect"}
+    assert "ClientConnectionError: Connect call failed ('192.0.2.10', 12445)" in caplog.text
+    assert TOKEN not in caplog.text
 
 
 async def test_controller_with_no_doors(hass: HomeAssistant, access: FakeAccess) -> None:

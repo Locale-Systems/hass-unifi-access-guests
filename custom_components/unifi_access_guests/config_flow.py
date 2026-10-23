@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import logging
 import secrets
 from typing import Any
 
@@ -45,6 +46,9 @@ from .const import (
 )
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 async def _fetch_doors(hass: HomeAssistant, data: Mapping[str, Any]) -> list[Door]:
     """List doors, raising ``UnifiOsKey`` for the commonest wrong token."""
     client = build_client(hass, dict(data))
@@ -53,6 +57,11 @@ async def _fetch_doors(hass: HomeAssistant, data: Mapping[str, Any]) -> list[Doo
     except AccessAuthError:
         if await client.unifi_os_key_app():
             raise UnifiOsKey from None
+        raise
+    except AccessError as err:
+        # The form can only say "could not reach" or "unexpected error"; the
+        # log says why.
+        _LOGGER.warning("Setting up UniFi Access Guests: %s", err)
         raise
 
 
