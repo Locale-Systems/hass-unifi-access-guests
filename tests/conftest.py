@@ -71,24 +71,49 @@ class FakeAccess:
         self._ids = (f"visitor-{n}" for n in itertools.count(1))
         # As on a real controller (LOC-304 probe, 2026-10-23), the doors sent
         # with a visitor become a door group made for it, and the visitor
-        # reads back with that group. Set either flag to leave groups behind.
+        # reads back with that group. Like that controller (probe run 2),
+        # neither an update nor a delete removes the old group; clear the
+        # flags for a controller that cleans up after itself.
         self.door_groups: dict[str, dict[str, Any]] = {}
         self.sent_resources: dict[str, list[dict[str, Any]]] = {}
-        self.leak_groups_on_update = False
-        self.leak_groups_on_delete = False
+        self.leak_groups_on_update = True
+        self.leak_groups_on_delete = True
         # An envelope error code for every door group lookup, when set.
         self.door_group_lookup_error: str | None = None
+        self.regroup_without_resources = False
+        # Make a new group even when a body names the visitor's own group.
+        self.ignore_group_references = False
+        self.refuse_door_group_delete = False
+        # Answer a group DELETE with success but keep the group.
+        self.door_group_delete_is_noop = False
         # Extra PIN rule: refuse when this returns True for (visitor id, pin).
         self.refuse_pin: Callable[[str, str], bool] | None = None
         self._group_ids = (f"group-{n}" for n in itertools.count(1))
 
     def _store_resources(self, visitor_id: str, data: dict[str, Any]) -> None:
-        """Turn the doors in a create/update body into a fresh door group."""
-        if "resources" not in data:
-            return
+        """Turn the doors in a create/update body into a fresh door group.
+
+        A body without resources keeps the visitor's group (unless
+        ``regroup_without_resources``), and one naming only existing door
+        groups keeps those. How a real controller treats both is what probe
+        ``--door-groups`` finds out.
+        """
         visitor = self.visitors[visitor_id]
-        self.sent_resources[visitor_id] = data["resources"]
         old = [r["id"] for r in visitor.get("resources") or [] if r.get("type") == "door_group"]
+        if "resources" not in data:
+            if not self.regroup_without_resources:
+                return
+            data = {"resources": self.sent_resources.get(visitor_id, [])}
+        named = [r for r in data["resources"] if r.get("type") == "door_group"]
+        if not self.ignore_group_references and named and len(named) == len(data["resources"]) and all(
+            r.get("id") in self.door_groups for r in named
+        ):
+            visitor["resources"] = [
+                {"id": r["id"], "name": self.door_groups[r["id"]]["name"], "type": "door_group"}
+                for r in named
+            ]
+            return
+        self.sent_resources[visitor_id] = data["resources"]
         group_id = next(self._group_ids)
         self.door_groups[group_id] = {
             "id": group_id,
@@ -148,6 +173,16 @@ class FakeAccess:
             visitor_id = self.add_visitor(**{k: v for k, v in data.items() if k != "resources"})
             self._store_resources(visitor_id, data)
             return self._ok(method, url, self.visitors[visitor_id])
+        if path == "door_groups" and method == "GET":
+            return self._ok(method, url, list(self.door_groups.values()))
+        if parts[0] == "door_groups" and len(parts) == 2 and method == "DELETE":
+            if self.refuse_door_group_delete:
+                return self._response(method, url, code="CODE_SYSTEM_ERROR", msg="Server system error.")
+            if parts[1] not in self.door_groups:
+                return self._response(method, url, status=404)
+            if not self.door_group_delete_is_noop:
+                del self.door_groups[parts[1]]
+            return self._ok(method, url)
         if parts[0] == "door_groups" and len(parts) == 2 and method == "GET":
             if self.door_group_lookup_error:
                 return self._response(method, url, code=self.door_group_lookup_error, msg="nope")

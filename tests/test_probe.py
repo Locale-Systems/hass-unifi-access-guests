@@ -53,6 +53,8 @@ def verdicts(steps) -> list[str]:
 
 
 async def test_happy_path(client: AccessClient, access: FakeAccess) -> None:
+    # A controller that removes replaced and deleted visitors' groups.
+    access.leak_groups_on_update = access.leak_groups_on_delete = False
     checked: list[tuple[str, int]] = []
 
     async def door_check(pin: str, end: int) -> None:
@@ -86,7 +88,7 @@ async def test_cleans_up_only_probe_visitors(client: AccessClient, access: FakeA
         remarks="[ha-guests:v1:probe:0123456789abcdef:01234567]",
     )
     steps = await run(client)
-    assert steps[-1].verdict == "PASS"
+    assert step_named(steps, "Delete every probe visitor").verdict == "PASS"
     assert set(access.visitors) == {hand_made, other_entry}
     assert leftover not in access.visitors
 
@@ -124,7 +126,7 @@ async def test_times_in_another_format_fail_step_one(
     steps = await run(client)
     assert steps[0].verdict == "FAIL"
     assert "read back" in steps[0].detail
-    assert steps[-1].verdict == "PASS"
+    assert step_named(steps, "Delete every probe visitor").verdict == "PASS"
     assert access.visitors == {}
 
 
@@ -158,6 +160,90 @@ async def test_refused_create_still_cleans_up(client: AccessClient, access: Fake
     assert access.visitors == {}
 
 
+def leftovers(access: FakeAccess) -> tuple[str, str]:
+    """An orphaned visitor group, a hand-made visitor with its own group, and
+    a group that isn't a visitor group. Returns (orphan id, hand-made group id)."""
+    access.door_groups["group-old"] = {"id": "group-old", "name": "visitor-1792776844541"}
+    access.door_groups["group-main"] = {"id": "group-main", "name": "Main doors"}
+    bob = access.add_visitor(first_name="Bob", last_name="Plumber", remarks="")
+    access._store_resources(bob, {"resources": [{"id": "door-gate", "type": "door"}]})
+    [bobs_group] = [r["id"] for r in access.visitors[bob]["resources"]]
+    return "group-old", bobs_group
+
+
+async def investigate(client, *, answer: bool | None = True):
+    async def confirm(orphans):
+        return answer
+
+    return await probe.investigate_door_groups(
+        client, "door-gate", now=Clock().now, confirm=None if answer is None else confirm
+    )
+
+
+async def test_door_groups_all_pass_and_delete_only_orphans(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    orphan, bobs_group = leftovers(access)
+    steps = await investigate(client)
+    assert [s.verdict for s in steps] == ["INFO", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS"]
+    assert "1 of those used by no visitor" in steps[0].detail
+    assert orphan not in access.door_groups
+    assert bobs_group in access.door_groups  # a live visitor's group stays
+    assert "group-main" in access.door_groups  # not a visitor group
+    assert [v["first_name"] for v in access.visitors.values()] == ["Bob"]
+
+
+@pytest.mark.parametrize("answer", [None, False])
+async def test_door_groups_left_alone_without_a_yes(
+    client: AccessClient, access: FakeAccess, answer
+) -> None:
+    orphan, _ = leftovers(access)
+    steps = await investigate(client, answer=answer)
+    assert steps[-1].verdict == "INFO" and "not deleted" in steps[-1].detail
+    assert orphan in access.door_groups
+
+
+async def test_update_without_resources_that_regroups_fails(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    access.regroup_without_resources = True
+    s = step_named(await investigate(client, answer=None), "An update without resources")
+    assert s.verdict == "FAIL" and "group changed" in s.detail
+
+
+async def test_update_naming_own_group_that_regroups_fails(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    access.ignore_group_references = True
+    s = step_named(await investigate(client, answer=None), "An update sending the visitor's own group")
+    assert s.verdict == "FAIL" and "group changed" in s.detail
+
+
+async def test_group_delete_that_keeps_the_group_fails(
+    client: AccessClient, access: FakeAccess
+) -> None:
+    access.door_group_delete_is_noop = True
+    steps = await investigate(client, answer=None)
+    for prefix in ("DELETE /door_groups", "Deleting the visitor, then"):
+        s = step_named(steps, prefix)
+        assert s.verdict == "FAIL" and "exists" in s.detail
+
+
+async def test_refused_group_delete_fails(client: AccessClient, access: FakeAccess) -> None:
+    access.refuse_door_group_delete = True
+    steps = await investigate(client)
+    assert step_named(steps, "DELETE /door_groups").verdict == "FAIL"
+    assert step_named(steps, "Deleting the visitor, then").verdict == "FAIL"
+    assert steps[-1].verdict == "FAIL"  # the offered clean-up could not delete either
+
+
+async def test_door_groups_survive_a_refused_create(client: AccessClient, access: FakeAccess) -> None:
+    access.fail["POST visitors"] = "code"
+    steps = await investigate(client, answer=None)
+    assert step_named(steps, "Create and read back").verdict == "FAIL"
+    assert step_named(steps, "Delete every probe visitor").verdict == "PASS"
+
+
 def step_named(steps, prefix: str):
     [s] = [s for s in steps if s.name.startswith(prefix)]
     return s
@@ -174,7 +260,7 @@ async def test_refusing_any_pin_fails_the_duplicate_control(
 
 
 async def test_door_group_left_by_an_update_fails(client: AccessClient, access: FakeAccess) -> None:
-    access.leak_groups_on_update = True
+    access.leak_groups_on_update, access.leak_groups_on_delete = True, False
     steps = await run(client)
     s = step_named(steps, "An update leaves")
     assert s.verdict == "FAIL" and "left the old one" in s.detail
@@ -182,7 +268,7 @@ async def test_door_group_left_by_an_update_fails(client: AccessClient, access: 
 
 
 async def test_door_group_left_by_a_delete_fails(client: AccessClient, access: FakeAccess) -> None:
-    access.leak_groups_on_delete = True
+    access.leak_groups_on_update, access.leak_groups_on_delete = False, True
     steps = await run(client)
     assert step_named(steps, "An update leaves").verdict == "PASS"
     s = step_named(steps, "Deleting a visitor")

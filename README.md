@@ -95,7 +95,8 @@ for the front door and a "Pool guests" calendar for the gate.
 
 ## Checked on a real controller
 
-The first probe run (2026-10-23, `tools/probe_controller.py` below) confirmed:
+Two probe runs (2026-10-23, `tools/probe_controller.py` below) and a test at
+the door confirmed:
 
 - visit times are Unix seconds, and read back unchanged;
 - PINs are set and removed at `/visitors/{id}/pin_codes`;
@@ -103,24 +104,30 @@ The first probe run (2026-10-23, `tools/probe_controller.py` below) confirmed:
   window, and goes back to `UPCOMING`. This is how the rolling window works;
 - the visitor list pages correctly;
 - a PIN another visitor holds is refused, but only with the generic
-  `CODE_SYSTEM_ERROR` / "Server system error.". The notification therefore
-  says the PIN is *most likely* in use and quotes the controller.
+  `CODE_SYSTEM_ERROR` / "Server system error." (the same visitor takes a
+  different PIN, so the refusal is about the duplicate). The notification
+  therefore says the PIN is *most likely* in use and quotes the controller;
+- a visitor with only a start and end time opens its door with its PIN
+  during the window.
 
 It also showed that the controller turns the doors sent with a visitor into a
 door group made for that visitor (`visitor-<timestamp>`), and that an update
 gives the visitor a new group. The integration never compares the doors it
 reads back, so this doesn't make every pass see a change.
 
-Still to check (the probe now covers the first two):
+**Open problem: door groups pile up.** Every visitor create and update makes
+a new door group, and neither an update nor deleting the visitor removes the
+old one. The Access app doesn't list them, but the API still finds them. As
+built, the integration would leave one group per guest per occurrence.
+`--door-groups` (below) finds out what the controller allows; the fix
+depends on its answers.
 
-- whether an update or a delete leaves the visitor's old door group behind.
-  The rolling window updates once per occurrence, so leftovers would pile up;
-- that the duplicate-PIN refusal really is about the duplicate: the probe now
-  sets a different PIN on the same visitor as a control;
-- that the PIN opens the chosen door for the whole window, and no other door
-  (by hand at the door, while the probe pauses);
+Still to check:
+
 - a repeating event, and two events with the same PIN, as one visitor that
-  moves on after each visit (in Home Assistant).
+  moves on after each visit (in Home Assistant);
+- that the PIN is refused at a door the visitor wasn't given (needs a
+  second door).
 
 Known limit: two config entries (two calendars) on the same controller don't
 know about each other's guests, so the same PIN on both still collides.
@@ -141,6 +148,18 @@ Without `--door` it lists the doors and stops. Run it again with `--door <id>`.
 In a terminal it pauses while the first visitor's window is open, so you can
 try its PIN at that door. It takes about two minutes, because one check waits
 for a short visit to end. It ends with a PASS/FAIL summary.
+
+With `--door-groups` it runs a different set of checks on one probe visitor:
+
+- whether an update without `resources` keeps the visitor's door group;
+- whether an update that sends the visitor's own group back keeps it;
+- whether `DELETE /door_groups/{id}` removes a group an update replaced, and
+  the group of a deleted visitor.
+
+It then lists the leftover `visitor-…` groups that no visitor uses, and in a
+terminal deletes them only if you type `yes`. Groups used by any visitor,
+including ones you made in the Access app, and groups with other names are
+never deleted.
 
 ## Development
 

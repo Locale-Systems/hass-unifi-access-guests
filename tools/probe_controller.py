@@ -349,6 +349,195 @@ def _group_verdict(states: dict[str, str], what: str) -> tuple[str, str]:
     return "PASS", f"all {len(states)} gone"
 
 
+DOOR_GROUPS_PATH = "/api/v1/developer/door_groups"
+
+
+async def list_door_groups(client: AccessClient) -> list[dict]:
+    """GET /door_groups as a list of group dicts (private helper; see above)."""
+    data = await client._request("GET", DOOR_GROUPS_PATH)  # noqa: SLF001
+    if isinstance(data, dict):  # tolerate a wrapped list
+        data = next((v for v in data.values() if isinstance(v, list)), [])
+    return [g for g in data or [] if isinstance(g, dict) and g.get("id")]
+
+
+async def orphan_visitor_groups(client: AccessClient) -> list[dict]:
+    """visitor-* door groups that no existing visitor (anyone's) refers to."""
+    used: set[str] = set()
+    for visitor in await client.list_visitors():
+        used |= door_groups_of(visitor)
+    return [
+        g for g in await list_door_groups(client)
+        if str(g.get("name", "")).startswith("visitor-") and str(g["id"]) not in used
+    ]
+
+
+async def investigate_door_groups(
+    client: AccessClient,
+    door: str,
+    *,
+    now: Callable[[], float] = time.time,
+    confirm: Callable[[list[dict]], Awaitable[bool]] | None = None,
+) -> list[Step]:
+    """Work out how to stop visitor door groups piling up (LOC-304).
+
+    Probe run 2 showed every visitor create and update makes a door group
+    and neither an update nor a delete removes the old one. This finds out
+    what the controller allows: updating without resources, updating with
+    the visitor's own group, and deleting a group. It then offers to delete
+    the leftover visitor groups, but only ones no existing visitor uses, and
+    only on a yes.
+    """
+    steps: list[Step] = []
+
+    def step(name: str) -> Step:
+        steps.append(Step(name))
+        say(f"\n== {name}")
+        return steps[-1]
+
+    def done(s: Step) -> None:
+        say(f"    {s.verdict}: {s.detail}")
+
+    async def group_now(visitor_id: str) -> str | None:
+        got = await find(client, visitor_id)
+        ids = door_groups_of(got) if got else set()
+        return next(iter(ids)) if len(ids) == 1 else None
+
+    try:
+        s = step("GET /door_groups lists the visitor groups")
+        try:
+            groups = await list_door_groups(client)
+            orphans = await orphan_visitor_groups(client)
+            visitor_groups = [g for g in groups if str(g.get("name", "")).startswith("visitor-")]
+            s.verdict = "INFO"
+            s.detail = (
+                f"{len(groups)} groups, {len(visitor_groups)} named visitor-*, "
+                f"{len(orphans)} of those used by no visitor"
+            )
+            if orphans:
+                say("    one leftover, as GET /door_groups/{id} returns it:")
+                sample = await client._request("GET", f"{DOOR_GROUPS_PATH}/{orphans[0]['id']}")  # noqa: SLF001
+                for line in json.dumps(sample, indent=2, default=str).splitlines()[:30]:
+                    say(f"      {line}")
+        except AccessError as err:
+            s.verdict, s.detail = "FAIL", f"could not list door groups: {err}"
+        done(s)
+
+        t = int(now())
+        v = spec(4, door, t + 24 * HOUR, t + 25 * HOUR)
+        v_id = await client.create_visitor(visitor_body(PROBE_ENTRY, v))
+        first = await group_now(v_id)
+        say(f"\n    created probe visitor {v_id} with door group {first}")
+
+        s = step("An update without resources keeps the visitor's group")
+        moved = VisitSpec(v.key, v.first_name, v.last_name, v.start + HOUR, v.end + HOUR, v.door_ids, None)
+        body = {k: val for k, val in visitor_body(PROBE_ENTRY, moved).items() if k != "resources"}
+        try:
+            await client.update_visitor(v_id, body)
+            after = await group_now(v_id)
+            got = await find(client, v_id)
+            if got is None or got.start_time != moved.start:
+                s.verdict, s.detail = "FAIL", "accepted, but the window did not move"
+            elif after == first:
+                s.verdict, s.detail = "PASS", f"window moved, group kept ({first})"
+            else:
+                s.verdict, s.detail = "FAIL", f"window moved, but group changed {first} -> {after}"
+        except AccessError as err:
+            s.verdict, s.detail = "FAIL", f"refused: {err}"
+        done(s)
+
+        s = step("An update sending the visitor's own group keeps it")
+        current = await group_now(v_id)
+        body = visitor_body(PROBE_ENTRY, moved)
+        body["resources"] = [{"id": current, "type": "door_group"}]
+        try:
+            await client.update_visitor(v_id, body)
+            after = await group_now(v_id)
+            if after == current:
+                s.verdict, s.detail = "PASS", f"group kept ({current})"
+            else:
+                s.verdict, s.detail = "FAIL", f"group changed {current} -> {after}"
+        except AccessError as err:
+            s.verdict, s.detail = "FAIL", f"refused: {err}"
+        done(s)
+
+        s = step("DELETE /door_groups/{id} removes the group an update replaced")
+        old = await group_now(v_id)
+        try:
+            await client.update_visitor(v_id, visitor_body(PROBE_ENTRY, moved))  # doors again
+            new = await group_now(v_id)
+            if not old or new == old:
+                s.verdict, s.detail = "INFO", f"no replaced group to delete (group {old} -> {new})"
+            else:
+                await client._request("DELETE", f"{DOOR_GROUPS_PATH}/{old}")  # noqa: SLF001
+                state = await door_group_state(client, old)
+                still = await find(client, v_id)
+                if state == "gone" and still is not None and door_groups_of(still) == {new}:
+                    s.verdict, s.detail = "PASS", f"deleted {old}; the visitor keeps {new}"
+                else:
+                    s.verdict, s.detail = "FAIL", f"after DELETE, {old} is {state}"
+        except AccessError as err:
+            s.verdict, s.detail = "FAIL", f"refused: {err}"
+        done(s)
+
+        s = step("Deleting the visitor, then its group, leaves nothing")
+        last = await group_now(v_id)
+        try:
+            await client.delete_visitor(v_id)
+            if last:
+                await client._request("DELETE", f"{DOOR_GROUPS_PATH}/{last}")  # noqa: SLF001
+                state = await door_group_state(client, last)
+                s.verdict = "PASS" if state == "gone" else "FAIL"
+                s.detail = f"visitor deleted; its group {last} is {state}"
+            else:
+                s.verdict, s.detail = "INFO", "visitor deleted; it had no single group to delete"
+        except AccessError as err:
+            s.verdict, s.detail = "FAIL", f"refused: {err}"
+        done(s)
+    except AccessError as err:
+        # Creating or reading the probe visitor failed; the experiments that
+        # depend on it can't run.
+        s = step("Create and read back a probe visitor")
+        s.verdict, s.detail = "FAIL", str(err)
+        done(s)
+    finally:
+        await cleanup(client, steps)
+
+    s = step("Delete leftover visitor door groups")
+    try:
+        orphans = await orphan_visitor_groups(client)
+    except AccessError as err:
+        s.verdict, s.detail = "FAIL", f"could not list them: {err}"
+        done(s)
+        return steps
+    if not orphans:
+        s.verdict, s.detail = "PASS", "none left"
+    else:
+        for g in orphans:
+            say(f"    {g['id']}  {g.get('name')}")
+        if confirm is None or not await confirm(orphans):
+            s.verdict, s.detail = "INFO", f"{len(orphans)} left; not deleted"
+        else:
+            failed = []
+            for g in orphans:
+                try:
+                    await client._request("DELETE", f"{DOOR_GROUPS_PATH}/{g['id']}")  # noqa: SLF001
+                except AccessError as err:
+                    failed.append(f"{g['id']}: {err}")
+            remaining = await orphan_visitor_groups(client)
+            s.verdict = "FAIL" if failed or remaining else "PASS"
+            s.detail = f"deleted {len(orphans) - len(failed)} of {len(orphans)}; {len(remaining)} left"
+            if failed:
+                s.detail += f"; errors: {failed}"
+    done(s)
+    return steps
+
+
+async def terminal_confirm(orphans: list[dict]) -> bool:
+    say(f"    These {len(orphans)} visitor-* door groups are used by no visitor.")
+    answer = await asyncio.to_thread(input, "    Delete them? Type yes to delete: ")
+    return answer.strip().lower() == "yes"
+
+
 async def _probe_visitors(client: AccessClient) -> list[Visitor]:
     try:
         return [v for v in await client.list_visitors() if is_probe(v)]
@@ -424,6 +613,8 @@ async def main() -> int:
     parser.add_argument("--pin", default=f"{secrets.randbelow(900000) + 100000}",
                         help="test PIN (default: random 6 digits)")
     parser.add_argument("--verify-ssl", action="store_true", help="check the console's certificate")
+    parser.add_argument("--door-groups", action="store_true",
+                        help="investigate door group clean-up instead of the main checks")
     parser.add_argument("--door-check", action=argparse.BooleanOptionalAction,
                         default=sys.stdin.isatty(),
                         help="pause to try the PIN at the door (default: on in a terminal)")
@@ -452,12 +643,17 @@ async def main() -> int:
             say(f"No door {args.door!r}; run without --door to list them.")
             return 1
 
-        steps = await run(
-            client,
-            args.door,
-            args.pin,
-            door_check=terminal_door_check if args.door_check else None,
-        )
+        if args.door_groups:
+            steps = await investigate_door_groups(
+                client, args.door, confirm=terminal_confirm if sys.stdin.isatty() else None
+            )
+        else:
+            steps = await run(
+                client,
+                args.door,
+                args.pin,
+                door_check=terminal_door_check if args.door_check else None,
+            )
 
     say("\nSummary")
     for s in steps:
