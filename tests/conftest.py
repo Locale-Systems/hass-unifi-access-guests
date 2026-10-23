@@ -61,6 +61,8 @@ class FakeAccess:
         self.visitors: dict[str, dict[str, Any]] = {}
         self.pins: dict[str, str] = {}
         self.fail: dict[str, int | str] = {}
+        # Refuse a PIN another visitor holds (the controller's assumed rule).
+        self.unique_pins = True
         self.calls: list[tuple[str, str, Any]] = []
         self._ids = (f"visitor-{n}" for n in itertools.count(1))
 
@@ -119,7 +121,9 @@ class FakeAccess:
             if method == "PUT":
                 # The controller lets a PIN belong to one credential holder.
                 # The real error code is unverified; this one is made up.
-                if any(p == data["pin_code"] for v, p in self.pins.items() if v != visitor_id):
+                if self.unique_pins and any(
+                    p == data["pin_code"] for v, p in self.pins.items() if v != visitor_id
+                ):
                     return self._response(
                         method, url, code="CODE_PIN_IN_USE", msg="PIN already in use"
                     )

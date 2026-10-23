@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connect to UniFi Access",
-        "description": "Create an API token in UniFi Access under Settings → General → API Token, with permission to view doors and to view and edit visitors.",
+        "description": "Create an API token in UniFi Access under Settings → General → API Token. The token has full access to UniFi Access, so keep it somewhere safe.",
         "data": {
           "host": "Host",
           "api_token": "API token",
@@ -26,7 +26,7 @@
       },
       "reauth_confirm": {
         "title": "New API token",
-        "description": "UniFi Access at {host} rejected the API token. Enter a token with permission to view doors and to view and edit visitors.",
+        "description": "UniFi Access at {host} rejected the API token. Enter a new one.",
         "data": {
           "api_token": "API token"
         }
@@ -34,7 +34,7 @@
     },
     "error": {
       "cannot_connect": "Could not reach UniFi Access.",
-      "invalid_auth": "The API token was rejected, or lacks permission to view doors.",
+      "invalid_auth": "The API token was rejected.",
       "invalid_host": "That host is not valid.",
       "no_doors": "UniFi Access reported no doors.",
       "no_doors_selected": "Choose at least one door.",

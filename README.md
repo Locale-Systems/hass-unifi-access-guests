@@ -69,8 +69,10 @@ calendar event as plain text, so share the calendar accordingly.
 
 ## Setup
 
-1. In UniFi Access, create an API token (Settings → General → API Token) with
-   permission to view doors and to view and edit visitors.
+1. In UniFi Access, create an API token (Settings → General → API Token).
+   Access has no limited tokens: this one can do anything in UniFi Access,
+   so store it like a password. The integration itself only reads doors
+   and changes the visitors it created.
 2. Copy `custom_components/unifi_access_guests` into your Home Assistant
    `config/custom_components/` (or add this repository to HACS), and restart.
 3. Settings → Devices & services → Add integration → **UniFi Access Guests**.
@@ -106,6 +108,23 @@ controller. Check these on a real one before relying on it:
 
 Known limit: two config entries (two calendars) on the same controller don't
 know about each other's guests, so the same PIN on both still collides.
+
+## Probing a real controller
+
+`tools/probe_controller.py` checks the items above against your controller
+with the integration's own client, before you install anything in Home
+Assistant. It creates up to three visitors named "Probe Visitor" on one door,
+then deletes them, along with any probe visitors an interrupted run left behind.
+It never touches other visitors. Run it with the dev venv (see Development):
+
+```bash
+.venv/bin/python tools/probe_controller.py --host 192.168.1.1 --token-ref "op://Private/UniFi Access API token/credential"
+```
+
+Without `--door` it lists the doors and stops. Run it again with `--door <id>`.
+In a terminal it pauses while the first visitor's window is open, so you can
+try its PIN at that door. It takes about two minutes, because one check waits
+for a short visit to end. It ends with a PASS/FAIL summary.
 
 ## Development
 
