@@ -1,0 +1,73 @@
+name: Release
+
+# To release:
+#   1. bump "version" in custom_components/unifi_access_guests/manifest.json
+#      and merge that to master;
+#   2. push a matching tag:  git tag v0.2.0 && git push origin v0.2.0
+#      (or GitHub → Releases → "Draft a new release" with that tag).
+# HACS installs the repository as it is at the release's tag, so the tag must
+# match the manifest's version: this checks that, runs the tests, and
+# publishes the GitHub release HACS offers (a bare tag is not enough).
+on:
+  push:
+    tags: ["v*"]
+
+# Read-only by default; only the publish job, which writes the release, can write.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+
+jobs:
+  version:
+    name: Tag matches the manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(jq -r .version custom_components/unifi_access_guests/manifest.json)"
+          if ! [[ "${tag}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is not a version tag like v1.2.3 or v1.2.3-beta.1"
+            exit 1
+          fi
+          if [[ "${tag}" != "${manifest}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match manifest.json version ${manifest}"
+            exit 1
+          fi
+
+  test:
+    name: Tests
+    needs: version
+    uses: ./.github/workflows/test.yaml
+
+  publish:
+    name: Publish GitHub release
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create the release, unless it was published from the GitHub UI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+            exit 0
+          fi
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" --generate-notes --verify-tag ${prerelease}
+
+  validate:
+    needs: publish
+    uses: ./.github/workflows/validate.yaml

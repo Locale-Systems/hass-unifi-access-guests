@@ -1,0 +1,25 @@
+name: HACS validation
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+# hacs/action publishes no usable releases (HACS documents @main), so it is
+# pinned to main's commit on the date shown. Dependabot cannot bump a branch
+# pin: refresh it by hand when a HACS validation rule changes. It reads the
+# repository through the GitHub API, so it passes only while the repository
+# is public.
+jobs:
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa # main, 2026-06-08
+        with:
+          category: integration

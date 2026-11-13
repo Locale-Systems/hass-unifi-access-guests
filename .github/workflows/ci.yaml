@@ -4,7 +4,6 @@ on:
   push:
     branches: [master]
   pull_request:
-    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -14,21 +13,26 @@ concurrency:
 permissions:
   contents: read
 
+# GitHub-hosted runners: the repository is public (HACS installs only from
+# public repositories), and the org's self-hosted runners are not offered to
+# public repositories, where a fork's pull request could run code on them.
 jobs:
   test:
     name: Tests
-    runs-on: linux-x64  # self-hosted Ryzen; runbook: locale-docs ci-self-hosted-linux-runner.md
+    uses: ./.github/workflows/test.yaml
+
+  hassfest:
+    name: hassfest
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The harness pin in requirements-dev.txt (HA 2026.10) requires 3.14.
-          python-version: "3.14"
+          persist-credentials: false
+      # home-assistant/actions publishes no releases; pinned to master's
+      # commit on the date shown. Refresh by hand with HA releases.
+      - uses: home-assistant/actions/hassfest@86d4564712fa02543c808e3a693dd04f9d3f8361 # master, 2026-10-26
 
-      - name: Install test harness
-        run: pip install -q -r requirements-dev.txt
-
-      - name: Test gate
-        run: python -m pytest -q
+  hacs:
+    name: HACS
+    uses: ./.github/workflows/validate.yaml

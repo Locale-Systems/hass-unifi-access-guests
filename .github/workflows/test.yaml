@@ -1,0 +1,31 @@
+name: Tests
+
+# Called by CI on every push, and by Release before it publishes.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          # The harness pin in requirements-dev.txt (HA 2026.10) requires 3.14.
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install test harness
+        run: pip install -q -r requirements-dev.txt
+
+      - name: Test gate
+        run: python -m pytest -q

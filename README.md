@@ -87,8 +87,14 @@ calendar event as plain text, so share the calendar accordingly.
    not work: the Access API rejects it, and setup says so. Store the token
    like a password. The integration itself only reads doors and changes the
    visitors it created.
-2. Copy `custom_components/unifi_access_guests` into your Home Assistant
-   `config/custom_components/` (or add this repository to HACS), and restart.
+2. Install it, then restart Home Assistant:
+   - **With HACS:** HACS → ⋮ → Custom repositories → add
+     `https://github.com/Locale-Systems/hass-unifi-access-guests` as type
+     **Integration**, then find **UniFi Access Guests** and download it.
+     HACS offers each new release as an update.
+   - **By hand:** copy `custom_components/unifi_access_guests` from the
+     [latest release](https://github.com/Locale-Systems/hass-unifi-access-guests/releases/latest)
+     into your Home Assistant `config/custom_components/`.
 3. Settings → Devices & services → Add integration → **UniFi Access Guests**.
    Enter the controller's address and the token, then choose the calendar and
    the doors its guests may open.
@@ -202,3 +208,14 @@ uv pip install --python .venv/bin/python -r requirements-dev.txt
 
 The tests run against Home Assistant 2026.10, pinned through
 `pytest-homeassistant-custom-component` in `requirements-dev.txt`.
+
+### Releasing
+
+Bump `version` in `custom_components/unifi_access_guests/manifest.json` on
+master, then push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`).
+The Release workflow checks the tag matches the manifest, runs the tests and
+publishes the GitHub release that HACS offers as an update.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
